@@ -1,13 +1,20 @@
 import asyncio
 import base64
 import unittest
+import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from comet.core.capabilities import CapabilityPlan
+from comet.core.capabilities import CapabilityPlan, EligibleProvider
 from comet.core.capability_states import EffectiveCapabilityState
 from comet.discovery.manager import DiscoveryResult
 from comet.metadata.manager import MetadataFetchResult, MetadataFetchStatus
 from comet.metadata.release_date import ReleaseInfo
+from comet.playback.presentation import ProviderOption
+from comet.playback.repository import RenderedCandidateIds
+from comet.playback.tokens import CapabilityCodec
+from comet.results.ordering import SelectionCounts
+from comet.results.pipeline import PipelineResult
 from comet.services.cache_state import (
     CacheCheckResult,
     CacheState,
@@ -17,6 +24,7 @@ from comet.services.media_search import (
     MediaSearchStatus,
     SearchCapacityTracker,
     _discovery_title_aliases,
+    _issue_provider_capabilities,
     _public_discovery_diagnostics,
     _search_configured_sources,
     search_media,
@@ -25,11 +33,68 @@ from comet.services.media_search import (
 _EMPTY_PLAN = CapabilityPlan(frozenset(), (), (), ())
 
 
+def _pipeline(candidates=(), options=()) -> PipelineResult:
+    return PipelineResult(
+        tuple(candidates),
+        tuple(options),
+        (),
+        len(candidates),
+        (),
+        SelectionCounts(),
+    )
+
+
 def _metadata_result(metadata: dict) -> MetadataFetchResult:
     return MetadataFetchResult(MetadataFetchStatus.OK, metadata, {})
 
 
 class UsenetOnlyMediaSearchTests(unittest.IsolatedAsyncioTestCase):
+    def test_hidden_alternatives_are_issued_as_one_signed_fallback_chain(self):
+        candidate_key = "candidate"
+        committed_candidate = str(uuid.uuid4())
+        committed_locator = str(uuid.uuid4())
+        locator = SimpleNamespace(locator_id="locator")
+        providers = tuple(
+            EligibleProvider(str(uuid.uuid4()), kind, index)
+            for index, kind in enumerate(("torbox_usenet", "nzbdav", "easynews"))
+        )
+        options = tuple(
+            ProviderOption(candidate_key, provider, (locator,))
+            for provider in providers
+        )
+        entry = SimpleNamespace(
+            option=options[0],
+            fallback_options=options[1:],
+            facts=SimpleNamespace(transport="usenet"),
+        )
+        codec = CapabilityCodec(
+            base64.urlsafe_b64encode(b"a" * 32).decode().rstrip("=")
+        )
+        partition = codec.configuration_partition(b"config")
+
+        capabilities = _issue_provider_capabilities(
+            codec,
+            partition,
+            (entry,),
+            {
+                candidate_key: RenderedCandidateIds(
+                    committed_candidate, {"locator": committed_locator}
+                )
+            },
+            media_type="movie",
+            season=None,
+            episode=None,
+        )
+        token = capabilities[(candidate_key, providers[0].configuration_id)]
+        intent = codec.decode_fallback_playback_intent(token, partition=partition)
+
+        self.assertEqual(intent.candidate_id, committed_candidate)
+        self.assertEqual(len(intent.options), 3)
+        self.assertEqual(
+            tuple(option.provider_configuration_id for option in intent.options),
+            tuple(provider.configuration_id for provider in providers),
+        )
+
     async def test_known_future_release_stops_before_discovery(self):
         config = {
             "schemaVersion": 2,
@@ -352,6 +417,10 @@ class UsenetOnlyMediaSearchTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=_metadata_result(metadata)),
             ),
             patch(
+                "comet.services.media_search._prepare_discovery_only_view",
+                new=AsyncMock(return_value=(_pipeline(), {}, {})),
+            ),
+            patch(
                 "comet.services.media_search.TorrentResultAccumulator"
             ) as torrent_manager,
             patch("comet.services.media_search.CacheStateManager") as cache_manager,
@@ -430,15 +499,10 @@ class UsenetOnlyMediaSearchTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=discovery),
             ) as search_sources,
             patch(
-                "comet.services.media_search._filter_and_rank_discovery_candidates",
-                new=AsyncMock(return_value=discovery.candidates),
-            ),
-            patch(
-                "comet.services.media_search._prepare_provider_view",
+                "comet.services.media_search._prepare_discovery_only_view",
                 new=AsyncMock(
                     return_value=(
-                        discovery.candidates,
-                        ("playable-option",),
+                        _pipeline(discovery.candidates, ("playable-option",)),
                         {},
                         {},
                     )
@@ -474,6 +538,8 @@ class UsenetOnlyMediaSearchTests(unittest.IsolatedAsyncioTestCase):
             "rtnSettings": None,
             "rtnRanking": None,
             "maxSize": 0,
+            "_releasePolicy": object(),
+            "_resultsModel": MagicMock(auxiliary=MagicMock(filterSummary="off")),
         }
         metadata = {
             "title": "Example",
@@ -493,12 +559,12 @@ class UsenetOnlyMediaSearchTests(unittest.IsolatedAsyncioTestCase):
             return_value=DiscoveryResult((), (), _EMPTY_PLAN, inflight=True)
         )
         manager.ingest_release_candidates = AsyncMock()
-        manager.rank_torrents = AsyncMock()
         manager.primary_cached = False
         manager.torrents = {}
-        manager.ranked_torrents = {}
         filtered_candidate = MagicMock()
         filtered_candidate.candidate_id = "usenet:test"
+        prepared = MagicMock()
+        prepared.releases = (MagicMock(candidate=filtered_candidate),)
         cache_manager = MagicMock()
         cache_manager.check_and_decide = AsyncMock(
             return_value=CacheCheckResult(
@@ -522,24 +588,27 @@ class UsenetOnlyMediaSearchTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=discovery),
             ),
             patch(
-                "comet.services.media_search._filter_and_rank_discovery_candidates",
+                "comet.services.media_search._normalize_discovery_candidates",
                 new=AsyncMock(return_value=(filtered_candidate,)),
+            ),
+            patch(
+                "comet.services.media_search.prepare_releases",
+                return_value=prepared,
+            ),
+            patch(
+                "comet.services.media_search.refresh_late_facts",
+                return_value=prepared,
             ),
             patch(
                 "comet.services.media_search._prepare_provider_view",
                 new=AsyncMock(
                     return_value=(
-                        (filtered_candidate,),
-                        ("playable-option",),
+                        _pipeline((filtered_candidate,), ("playable-option",)),
                         {},
                         {},
                     )
                 ),
             ) as prepare,
-            patch(
-                "comet.services.media_search.sort_candidates",
-                return_value=(filtered_candidate,),
-            ),
             patch(
                 "comet.services.media_search.TorrentResultAccumulator",
                 return_value=manager,
@@ -568,7 +637,7 @@ class UsenetOnlyMediaSearchTests(unittest.IsolatedAsyncioTestCase):
                 "",
                 lambda *_args, **_kwargs: None,
             )
-            prepare.return_value = ((), (), {}, {})
+            prepare.return_value = (_pipeline(), {}, {})
             result_without_fallback = await search_media(
                 "movie",
                 "tt1234567",

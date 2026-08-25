@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from RTN import ParsedData
+from RTN import ParsedData, parse
 
 from comet.core.scrape import ScrapeContext
 from comet.core.sources import (
@@ -29,6 +29,38 @@ from comet.services.orchestration import (
 
 
 class TorrentOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_episode_guard_is_aggregated_and_summary_off_allocates_nothing(self):
+        arguments = {
+            "media_type": "series",
+            "media_full_id": "tt123:1:2",
+            "media_only_id": "tt123",
+            "title": "Show",
+            "year": 2026,
+            "year_end": None,
+            "season": 1,
+            "episode": 2,
+            "aliases": {},
+            "remove_adult_content": False,
+        }
+        enabled = TorrentResultAccumulator(**arguments, summary_enabled=True)
+        torrent = {
+            "infoHash": "a" * 40,
+            "title": "Show.S01E03.1080p.WEB-DL",
+            "parsed": parse("Show.S01E03.1080p.WEB-DL"),
+            "fileIndex": None,
+            "seeders": 1,
+            "size": 100,
+            "tracker": "test",
+            "sources": [],
+        }
+        enabled._publish_ready_torrents([torrent])
+        self.assertEqual(enabled.guard_rejection_counts, {"episode": 1})
+
+        disabled = TorrentResultAccumulator(**arguments, summary_enabled=False)
+        disabled._publish_ready_torrents([torrent])
+        self.assertIsNone(disabled.guard_rejection_counts)
+        self.assertIsNone(disabled._counted_presentation_rejections)
+
     async def test_background_scrape_builds_torrent_only_plan(self):
         manager = TorrentResultAccumulator(
             media_type="movie",
@@ -136,6 +168,7 @@ class TorrentOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                     "isPrivate": False,
                 }
             ],
+            track_diagnostics=False,
         )
 
     async def test_scrapers_receive_titles_selected_from_configured_languages(self):

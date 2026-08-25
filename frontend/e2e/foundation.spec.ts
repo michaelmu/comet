@@ -102,20 +102,31 @@ test.beforeEach(async ({ page }, testInfo) => {
       ]
     : [];
   const configuration = {
-    cachedOnly: false,
     debridServices: [],
     debridStreamProxyPassword: "",
     enableTorrent: true,
-    languages: { allowed: [], exclude: [], preferred: [], required: [] },
-    maxResultsPerResolution: 0,
-    maxSize: 0,
-    options: {
-      allow_english_in_languages: false,
-      remove_unknown_languages: false,
+    languages: { allowed: [], exclude: [], preferred: [], required: [], unknown: "allow" },
+    results: {
+      alternatives: {
+        cached: "all",
+        direct: "always",
+        fallback: false,
+        hideUncachedWhenCached: false,
+        uncached: "all",
+        usenet: "all",
+      },
+      auxiliary: { debridSync: "bottom", errors: "bottom", filterSummary: "whenEmpty" },
+      display: { preset: "default" },
+      filters: { dimensions: {}, keywords: {}, ranges: {}, removeTrash: true, rules: [] },
+      limits: [],
+      sort: [
+        { direction: "desc", key: "resolution", scope: "all" },
+        { direction: "desc", key: "cached", scope: "all" },
+        { direction: "desc", key: "language", scope: "all" },
+        { direction: "desc", key: "rank", scope: "all" },
+        { direction: "asc", key: "provider", scope: "all" },
+      ],
     },
-    removeTrash: true,
-    resolutions: {},
-    resultFormat: ["all"],
     schemaVersion: 1,
     scrapeDebridAccountTorrents: false,
   };
@@ -174,10 +185,81 @@ test.beforeEach(async ({ page }, testInfo) => {
           default_configuration: configuration,
           languages: { en: "🇬🇧", fr: "🇫🇷" },
           native_usenet_sources: ["instance_pool", "personal_servers"],
-          resolutions: ["r2160p", "r1080p", "unknown"],
-          result_formats: ["title", "video_info", "size", "languages"],
+          result_display_presets: {
+            compact: { description: "Compact preview", name: "Compact" },
+            default: { description: "Default preview", name: "Default" },
+            technical: { description: "Technical preview", name: "Technical" },
+          },
+          result_facets: {
+            quality: ["remux", "bluray", "webdl"],
+            resolution: ["2160p", "1080p", "720p"],
+            visual: ["dolbyVision", "hdr", "sdr", "3d"],
+          },
+          result_fields: ["title", "resolution", "provider.name", "cache.icon"],
+          result_policy_fields: ["title", "seeders", "visual", "container"],
+          result_scopes: [
+            "all",
+            "cached",
+            "uncached",
+            "directTorrent",
+            "needsDownload",
+            "torrent",
+            "usenet",
+          ],
+          result_sort_keys: [
+            "resolution",
+            "cached",
+            "language",
+            "keyword",
+            "preferenceRule",
+            "rank",
+            "quality",
+            "videoCodec",
+            "hdr",
+            "audio",
+            "channels",
+            "subtitles",
+            "size",
+            "seeders",
+            "age",
+            "provider",
+            "transport",
+            "source",
+            "releaseGroup",
+            "private",
+          ],
+          result_sort_vocabulary: {
+            quality: ["remux", "bluray", "webdl"],
+            resolution: ["2160p", "1080p", "720p"],
+          },
+          result_sort_presets: {
+            instant: [
+              { direction: "desc", key: "cached" },
+              { direction: "desc", key: "resolution" },
+            ],
+            language: [{ direction: "desc", key: "language" }],
+            smart: [
+              { direction: "desc", key: "resolution" },
+              { direction: "desc", key: "cached" },
+            ],
+            qualitySeeders: [
+              { direction: "desc", key: "resolution" },
+              { direction: "desc", key: "seeders", scope: "needsDownload" },
+            ],
+          },
           usenet_provider_kinds: ["torbox_usenet", "stremio_nntp", "comet_native_usenet"],
           usenet_source_kinds: ["newznab"],
+        }),
+      ),
+    }),
+  );
+  await page.route("**/api/v1/configure/results/preview", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(
+        envelope({
+          description: "📄 Movie.Title.2024.1080p\n📹 H.264 • HDR",
+          name: "[RD ⚡] Comet 1080p",
         }),
       ),
     }),
@@ -1246,6 +1328,45 @@ test("configurator copies a validated v1 manifest link", async ({ page }) => {
     .toContain("/manifest.json");
 });
 
+test("preferences import uses the canonical validator exactly once", async ({ page }) => {
+  let validations = 0;
+  await page.unroute("**/api/v1/configure/validate");
+  await page.route("**/api/v1/configure/validate", async (route) => {
+    validations += 1;
+    const request = route.request().postDataJSON() as { configuration: unknown };
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(envelope(request.configuration)),
+    });
+  });
+  await page.goto("/configure");
+  await page.getByText("Results", { exact: true }).click();
+  await page.getByRole("button", { name: "Advanced", exact: true }).click();
+
+  await page.locator('.results-portability input[type="file"]').setInputFiles({
+    buffer: (globalThis as unknown as { Buffer: { from(value: string): Uint8Array } }).Buffer.from(
+      JSON.stringify({
+        configuration: {
+          languages: { preferred: ["fr"] },
+          results: { display: { preset: "compact" } },
+        },
+        format: "comet-config",
+        scope: "preferences",
+        version: 1,
+      }),
+    ) as never,
+    mimeType: "application/json",
+    name: "comet-preferences.json",
+  });
+
+  await expect(page.getByText("Imported configuration is ready.")).toBeVisible();
+  expect(validations).toBe(1);
+  await page.getByRole("button", { name: "Appearance", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Compact", exact: true })).toHaveClass(
+    /chip--only/,
+  );
+});
+
 test("switching a torrent row to debrid keeps a valid account after toggling Usenet", async ({
   page,
 }) => {
@@ -1378,18 +1499,18 @@ test("configurator uses compact controls without hiding inactive Usenet fields",
   );
 
   await page.getByText("Results", { exact: true }).click();
-  const resultFields = page.locator(".multi-select-field").filter({ hasText: "Result fields" });
-  await expect(resultFields.locator(".multi-select__badge")).toHaveCount(4);
-  const resolutions = page.getByRole("button", { name: "Resolutions", exact: true });
-  await resolutions.focus();
-  await resolutions.press("Enter");
-  await expect(page.getByLabel("Search resolutions")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "2160p", exact: true })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
-
-  await resolutions.press("Escape");
+  await expect(page.locator(".results-tab")).toHaveCount(5);
+  await expect(
+    page.getByRole("list", { name: "Reorder criterion" }).locator(":scope > li"),
+  ).toHaveCount(5);
+  await page.getByRole("button", { name: "Filters", exact: true }).click();
+  await page.getByRole("button", { name: "Dolby Vision — ignored" }).click();
+  await expect(page.getByRole("button", { name: /Dolby Vision — kept only/ })).toBeVisible();
+  await page.getByRole("button", { name: "Appearance", exact: true }).click();
+  await expect(page.locator(".result-preview")).toContainText("Default preview");
+  await page.getByRole("button", { name: "Technical", exact: true }).click();
+  await expect(page.locator(".result-preview")).toContainText("Technical preview");
+  await page.getByRole("button", { name: "Order", exact: true }).click();
   await page
     .locator(".configuration-section__title")
     .getByText("Languages", { exact: true })
@@ -1408,6 +1529,10 @@ test("configurator uses compact controls without hiding inactive Usenet fields",
     discoverySources?: unknown[];
     enabledTransports?: string[];
     playbackProviders?: Array<{ kind: string }>;
+    results?: {
+      display?: { preset?: string };
+      filters?: { dimensions?: { visual?: { only?: string[] } } };
+    };
   } = {};
   await page.unroute("**/api/v1/configure/validate");
   await page.route("**/api/v1/configure/validate", async (route) => {
@@ -1430,6 +1555,8 @@ test("configurator uses compact controls without hiding inactive Usenet fields",
   expect(submitted.enabledTransports).toEqual(["bittorrent"]);
   expect(submitted.discoverySources).toEqual([]);
   expect(submitted.playbackProviders?.some(({ kind }) => kind === "stremio_nntp")).toBe(false);
+  expect(submitted.results?.filters?.dimensions?.visual?.only).toEqual(["dolbyVision"]);
+  expect(submitted.results?.display?.preset).toBe("technical");
 
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -1494,7 +1621,7 @@ test("torrent services can be reordered from the drag handle", async ({ page, is
   await page.getByRole("button", { name: "Add service" }).click();
 
   const rows = page.locator(".debrid-row");
-  const torBoxHandle = rows.nth(2).getByRole("button", { name: "Reorder service" });
+  const torBoxHandle = rows.nth(2).getByRole("button", { name: /Reorder service/ });
   const firstRow = await rows.nth(0).boundingBox();
   if (firstRow === null) throw new Error("First service row geometry is unavailable");
   await torBoxHandle.hover();

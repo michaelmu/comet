@@ -1,10 +1,8 @@
 import unittest
-import uuid
 from dataclasses import replace
 
 from RTN import parse
 
-from comet.core.capabilities import EligibleProvider
 from comet.core.sources import (
     LocatorKind,
     LocatorPolicy,
@@ -15,7 +13,6 @@ from comet.core.sources import (
     TransportKind,
 )
 from comet.playback.groups import build_presentation_groups
-from comet.playback.presentation import ProviderOption, select_presentation
 
 
 def _candidate(
@@ -129,172 +126,4 @@ class PresentationGroupingTests(unittest.TestCase):
         self.assertEqual(
             {group.resolution for group in groups},
             {"1080p", "unknown"},
-        )
-
-    def test_group_limit_keeps_all_cross_family_members(self):
-        torrent = _candidate(
-            "torrent",
-            TransportKind.BITTORRENT,
-            "Movie.2026.1080p.WEB-DL-GROUP",
-        )
-        usenet = _candidate(
-            "usenet",
-            TransportKind.USENET,
-            "Movie.2026.1080p.WEB-DL-GROUP",
-        )
-        later = _candidate(
-            "later",
-            TransportKind.USENET,
-            "Movie.2026.1080p.WEB-DL-OTHER",
-        )
-        torrent_provider = EligibleProvider(str(uuid.uuid4()), "direct_torrent", 0)
-        usenet_provider = EligibleProvider(str(uuid.uuid4()), "stremio_nntp", 1)
-        options = (
-            ProviderOption(
-                torrent.candidate_id,
-                torrent_provider,
-                torrent.locators,
-            ),
-            ProviderOption(
-                usenet.candidate_id,
-                usenet_provider,
-                usenet.locators,
-            ),
-            ProviderOption(
-                later.candidate_id,
-                usenet_provider,
-                later.locators,
-            ),
-        )
-
-        candidates, retained = select_presentation(
-            (torrent, usenet, later),
-            options,
-            cached_only=False,
-            max_releases_per_resolution=1,
-        )
-
-        self.assertEqual(candidates, (torrent, usenet))
-        self.assertEqual(
-            [option.candidate_id for option in retained],
-            ["torrent", "usenet"],
-        )
-
-    def test_confirmed_debrid_cache_is_preferred_only_inside_same_group(self):
-        torrent = _candidate(
-            "torrent",
-            TransportKind.BITTORRENT,
-            "Movie.2026.1080p.WEB-DL-GROUP",
-        )
-        usenet = _candidate(
-            "usenet",
-            TransportKind.USENET,
-            "Movie.2026.1080p.WEB-DL-GROUP",
-        )
-        torrent_provider = EligibleProvider(str(uuid.uuid4()), "realdebrid", 1)
-        usenet_provider = EligibleProvider(str(uuid.uuid4()), "stremio_nntp", 0)
-        options = (
-            ProviderOption(
-                torrent.candidate_id,
-                torrent_provider,
-                torrent.locators,
-                cached=True,
-            ),
-            ProviderOption(
-                usenet.candidate_id,
-                usenet_provider,
-                usenet.locators,
-            ),
-        )
-
-        candidates, retained = select_presentation(
-            (torrent, usenet),
-            options,
-            cached_only=False,
-            max_releases_per_resolution=0,
-        )
-
-        self.assertEqual(candidates, (torrent, usenet))
-        self.assertEqual(
-            [option.candidate_id for option in retained],
-            ["torrent", "usenet"],
-        )
-
-    def test_cached_lower_ranked_release_never_overtakes_content_rank(self):
-        ranked_first = _candidate(
-            "ranked-first",
-            TransportKind.USENET,
-            "First.2026.1080p.WEB-DL-GROUP",
-        )
-        cached_later = _candidate(
-            "cached-later",
-            TransportKind.BITTORRENT,
-            "Later.2026.1080p.WEB-DL-OTHER",
-        )
-        options = (
-            ProviderOption(
-                ranked_first.candidate_id,
-                EligibleProvider(str(uuid.uuid4()), "stremio_nntp", 0),
-                ranked_first.locators,
-            ),
-            ProviderOption(
-                cached_later.candidate_id,
-                EligibleProvider(str(uuid.uuid4()), "realdebrid", 1),
-                cached_later.locators,
-                cached=True,
-            ),
-        )
-
-        _candidates, retained = select_presentation(
-            (ranked_first, cached_later),
-            options,
-            cached_only=False,
-            max_releases_per_resolution=0,
-        )
-
-        self.assertEqual(
-            [option.candidate_id for option in retained],
-            ["ranked-first", "cached-later"],
-        )
-
-    def test_cached_only_is_scoped_to_debrid_paths(self):
-        torrent = _candidate(
-            "torrent",
-            TransportKind.BITTORRENT,
-            "Torrent.2026.1080p.WEB-DL-GROUP",
-        )
-        usenet = _candidate(
-            "usenet",
-            TransportKind.USENET,
-            "Usenet.2026.1080p.WEB-DL-GROUP",
-        )
-        options = (
-            ProviderOption(
-                torrent.candidate_id,
-                EligibleProvider(str(uuid.uuid4()), "realdebrid", 0),
-                torrent.locators,
-            ),
-            ProviderOption(
-                torrent.candidate_id,
-                EligibleProvider(str(uuid.uuid4()), "direct_torrent", 1),
-                torrent.locators,
-            ),
-            ProviderOption(
-                usenet.candidate_id,
-                EligibleProvider(str(uuid.uuid4()), "stremio_nntp", 2),
-                usenet.locators,
-            ),
-        )
-
-        candidates, retained = select_presentation(
-            (torrent, usenet),
-            options,
-            cached_only=True,
-            max_releases_per_resolution=0,
-        )
-
-        self.assertEqual(candidates, (torrent, usenet))
-        self.assertEqual(
-            [option.provider.kind for option in retained],
-            ["direct_torrent", "stremio_nntp"],
         )

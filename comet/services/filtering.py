@@ -15,6 +15,7 @@ from comet.core.execution import configured_max_workers, get_executor
 from comet.core.locator_codec import parsed_json
 from comet.core.models import settings
 from comet.core.sources import ReleaseCandidate, TorrentLocator
+from comet.discovery.models import CandidateNormalizationResult
 from comet.observability import log
 from comet.utils.languages import alias_language
 from comet.utils.parsing import ensure_multi_language
@@ -333,7 +334,12 @@ def filter_release_records(
     aliases,
     remove_adult_content,
     content_id=None,
+    rejection_counts=None,
 ):
+    def reject(reason: str) -> None:
+        if rejection_counts is not None:
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
     results = []
     matcher = TitleMatcher(title, year, year_end, media_type, aliases)
     aliases = matcher.aliases
@@ -373,6 +379,7 @@ def filter_release_records(
         release_title = record["title"]
 
         if release_title == "":
+            reject("title")
             _log_filter_decision(
                 "empty_release",
                 release_title,
@@ -385,6 +392,7 @@ def filter_release_records(
         try:
             parsed = _parse_with_cache(release_title)
         except ValidationError:
+            reject("title")
             _log_filter_decision(
                 "parse_error",
                 release_title,
@@ -410,6 +418,7 @@ def filter_release_records(
         ensure_multi_language(parsed)
 
         if remove_adult_content and parsed.adult:
+            reject("adult")
             _log_filter_decision(
                 "adult_content",
                 release_title,
@@ -420,6 +429,7 @@ def filter_release_records(
             continue
 
         if not parsed.parsed_title:
+            reject("title")
             _log_filter_decision(
                 "missing_title",
                 release_title,
@@ -430,6 +440,7 @@ def filter_release_records(
             continue
 
         if not matcher.matches_title(release_title, parsed.parsed_title):
+            reject("title")
             _log_filter_decision(
                 "title_mismatch",
                 release_title,
@@ -440,6 +451,7 @@ def filter_release_records(
             continue
 
         if not matcher.matches_year(parsed.year):
+            reject("year")
             _log_filter_decision(
                 "year_mismatch",
                 release_title,
@@ -465,6 +477,31 @@ def filter_release_candidates(
     content_id: str | None = None,
 ) -> tuple[ReleaseCandidate, ...]:
     """Parse and media-match transport-neutral discovery candidates."""
+    return _filter_release_candidates_with_stats(
+        candidates,
+        title,
+        year,
+        year_end,
+        media_type,
+        aliases,
+        remove_adult_content,
+        content_id,
+        False,
+    ).candidates
+
+
+def _filter_release_candidates_with_stats(
+    candidates: tuple[ReleaseCandidate, ...],
+    title: str,
+    year: int | None,
+    year_end: int | None,
+    media_type: str,
+    aliases: dict,
+    remove_adult_content: bool,
+    content_id: str | None,
+    collect_rejections: bool,
+) -> CandidateNormalizationResult:
+    counts = {} if collect_rejections else None
     records = [
         {"title": candidate.title, "candidate": candidate} for candidate in candidates
     ]
@@ -477,6 +514,7 @@ def filter_release_candidates(
         aliases,
         remove_adult_content,
         content_id,
+        counts,
     )
     normalized = []
     for record in filtered:
@@ -490,7 +528,11 @@ def filter_release_candidates(
             for locator in candidate.locators
         )
         normalized.append(replace(candidate, parsed=parsed, locators=locators))
-    return tuple(normalized)
+    return CandidateNormalizationResult(
+        tuple(normalized),
+        len(candidates),
+        tuple((key, value) for key, value in (counts or {}).items() if value),
+    )
 
 
 async def normalize_release_candidates(
@@ -504,8 +546,33 @@ async def normalize_release_candidates(
     content_id: str | None = None,
 ) -> tuple[ReleaseCandidate, ...]:
     """Run the deterministic, shareable RTN stage outside request policy."""
+    result = await normalize_release_candidates_with_stats(
+        candidates,
+        title=title,
+        year=year,
+        year_end=year_end,
+        media_type=media_type,
+        aliases=aliases,
+        content_id=content_id,
+        collect_rejections=False,
+    )
+    return result.candidates
+
+
+async def normalize_release_candidates_with_stats(
+    candidates: tuple[ReleaseCandidate, ...],
+    *,
+    title: str,
+    year: int | None,
+    year_end: int | None,
+    media_type: str,
+    aliases: dict[str, list[str]],
+    content_id: str | None = None,
+    collect_rejections: bool,
+) -> CandidateNormalizationResult:
+    """Normalize once and optionally retain only dense aggregate guard counts."""
     if not candidates:
-        return ()
+        return CandidateNormalizationResult((), 0)
     worker_count = max(1, configured_max_workers() or 1)
     chunk_size = max(
         20,
@@ -517,7 +584,7 @@ async def normalize_release_candidates(
         *(
             loop.run_in_executor(
                 executor,
-                filter_release_candidates,
+                _filter_release_candidates_with_stats,
                 candidates[offset : offset + chunk_size],
                 title,
                 year,
@@ -526,24 +593,20 @@ async def normalize_release_candidates(
                 aliases,
                 False,
                 content_id,
+                collect_rejections,
             )
             for offset in range(0, len(candidates), chunk_size)
         )
     )
-    return tuple(candidate for chunk in chunks for candidate in chunk)
-
-
-def apply_release_candidate_policy(
-    candidates: tuple[ReleaseCandidate, ...],
-    *,
-    remove_adult_content: bool,
-) -> tuple[ReleaseCandidate, ...]:
-    """Apply the cheap request-specific policy after shared normalization."""
-    return tuple(
-        candidate
-        for candidate in candidates
-        if candidate.parsed is not None
-        and (not remove_adult_content or not candidate.parsed.adult)
+    counts: dict[str, int] | None = {} if collect_rejections else None
+    if counts is not None:
+        for chunk in chunks:
+            for reason, count in chunk.rejection_counts:
+                counts[reason] = counts.get(reason, 0) + count
+    return CandidateNormalizationResult(
+        tuple(candidate for chunk in chunks for candidate in chunk.candidates),
+        len(candidates),
+        tuple((key, value) for key, value in (counts or {}).items() if value),
     )
 
 

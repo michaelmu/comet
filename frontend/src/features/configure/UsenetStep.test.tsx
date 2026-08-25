@@ -1,8 +1,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ConfiguratorBootstrapData } from "../../api/generated/contracts";
 import type { BindingDraft } from "./model";
+import { bootstrapFixture } from "./testing";
 import { UsenetStep } from "./UsenetStep";
 
 vi.mock("react-i18next", () => ({
@@ -11,23 +11,11 @@ vi.mock("react-i18next", () => ({
 
 afterEach(cleanup);
 
-const bootstrap = {
-  capabilities: {
-    native_usenet: true,
-    proxy_debrid_stream: true,
-    stremio_api_prefix: "",
-    torrent_streams: true,
-    usenet: true,
-  },
-  debrid_services: [],
-  default_configuration: {},
-  languages: {},
+const bootstrap = bootstrapFixture({
+  capabilities: { native_usenet: true, proxy_debrid_stream: true, usenet: true },
   native_usenet_sources: ["personal_servers"],
-  resolutions: [],
-  result_formats: [],
   usenet_provider_kinds: ["torbox_usenet", "comet_native_usenet", "easynews"],
-  usenet_source_kinds: [],
-} as ConfiguratorBootstrapData;
+});
 
 describe("UsenetStep", () => {
   it("shows the precise capability result on its binding card", () => {

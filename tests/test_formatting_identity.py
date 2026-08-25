@@ -1,35 +1,12 @@
 import unittest
-from decimal import Decimal
 
-from RTN import ParsedData
-
-from comet.utils.formatting import (
-    format_audio_info,
-    format_bytes,
-    format_group_info,
-    format_quality_info,
-    format_video_info,
-    get_language_emoji,
-    normalize_info_hash,
-    size_to_bytes,
-)
+from comet.utils.formatting import normalize_info_hash, size_to_bytes
 from comet.utils.media_ids import normalize_cache_media_ids
 from comet.utils.status_keys import normalize_status_key
 from comet.utils.year import parse_year, parse_year_range
 
 
 class FormattingIdentityContractTests(unittest.TestCase):
-    def test_punjabi_uses_the_indian_flag(self):
-        self.assertEqual(get_language_emoji("pa"), "🇮🇳")
-
-    def test_byte_formatting_rejects_nonfinite_negative_and_coerced_values(self):
-        self.assertEqual(format_bytes(0), "0.0 B")
-        self.assertEqual(format_bytes(Decimal(1536)), "1.5 KB")
-
-        for value in (True, "1024", -1, float("nan"), float("inf")):
-            with self.subTest(value=value):
-                self.assertIsNone(format_bytes(value))
-
     def test_size_parser_requires_two_finite_nonnegative_current_fields(self):
         self.assertEqual(size_to_bytes("1.5 GB"), 1_610_612_736)
         self.assertEqual(size_to_bytes("0 B"), 0)
@@ -71,32 +48,6 @@ class FormattingIdentityContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIsNone(parse_year(value))
                 self.assertEqual(parse_year_range(value), (None, None))
-
-    def test_parsed_data_formatting_uses_the_exact_current_fields(self):
-        parsed = ParsedData(
-            raw_title="Movie.2026",
-            codec="hevc",
-            hdr=["DV", "HDR"],
-            bit_depth="10bit",
-            audio=["Dolby Digital Plus"],
-            channels=["5.1"],
-            quality="WEB-DL",
-            edition="Director's Cut",
-            proper=True,
-            repack=True,
-            upscaled=True,
-            remastered=True,
-            extended=True,
-            group="ReleaseGroup",
-        )
-
-        self.assertEqual(format_video_info(parsed), "hevc • DV • HDR • 10bit")
-        self.assertEqual(format_audio_info(parsed), "Dolby Digital Plus • 5.1")
-        self.assertEqual(
-            format_quality_info(parsed),
-            "WEB-DL • Director's Cut • PROPER • REPACK • UPSCALED • REMASTERED • EXTENDED",
-        )
-        self.assertEqual(format_group_info(parsed), "ReleaseGroup")
 
     def test_cache_media_ids_are_deduplicated_without_aliasing_primary(self):
         self.assertEqual(

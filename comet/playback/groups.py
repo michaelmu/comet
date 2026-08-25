@@ -122,21 +122,3 @@ def build_presentation_groups(
         PresentationGroup(group_key[1], tuple(members))
         for group_key, members in grouped.items()
     )
-
-
-def limit_presentation_groups(
-    groups: tuple[PresentationGroup, ...],
-    max_releases_per_resolution: int,
-) -> tuple[PresentationGroup, ...]:
-    """Apply a resolution limit once per eligible group in ranked order."""
-    if max_releases_per_resolution <= 0:
-        return groups
-    retained = []
-    counts: dict[str, int] = {}
-    for group in groups:
-        count = counts.get(group.resolution, 0)
-        if count >= max_releases_per_resolution:
-            continue
-        counts[group.resolution] = count + 1
-        retained.append(group)
-    return tuple(retained)

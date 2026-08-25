@@ -17,14 +17,9 @@ from comet.core.capability_bindings import (
     ensure_playback_capability_states,
     native_instance_credential_material,
 )
-from comet.core.execution import get_executor
 from comet.core.models import database, settings
 from comet.core.scrape import ScrapeContext
-from comet.core.sources import (
-    TORRENT_PROVIDER_KINDS,
-    ReleaseCandidate,
-    ReleaseScope,
-)
+from comet.core.sources import ReleaseCandidate, ReleaseScope
 from comet.debrid.exceptions import DebridAuthError, DebridLinkGenerationError
 from comet.discovery import SearchCoordinator, build_discovery_adapters
 from comet.discovery.capabilities import (
@@ -33,7 +28,7 @@ from comet.discovery.capabilities import (
     record_discovery_capability_failure,
 )
 from comet.discovery.manager import DiscoveryResult
-from comet.discovery.models import MediaQuery
+from comet.discovery.models import CandidateNormalizationResult, MediaQuery
 from comet.discovery.torrent_repository import (
     TorrentReleaseRepository,
     torrent_candidate_from_runtime,
@@ -46,13 +41,19 @@ from comet.metadata.release_date import release_dates
 from comet.observability import current_request_id, log, metrics
 from comet.playback.presentation import (
     ProviderOption,
-    build_provider_options,
+    issue_fallback_option_capability,
     issue_provider_option_capability,
-    select_presentation,
 )
 from comet.playback.registry import build_playback_providers
 from comet.playback.repository import RenderedCandidateIds, RenderedReleaseRepository
 from comet.playback.tokens import CapabilityCodec
+from comet.results.pipeline import (
+    PipelineResult,
+    PreparedReleases,
+    finalize_results,
+    prepare_releases,
+    refresh_late_facts,
+)
 from comet.services.anime import anime_mapper
 from comet.services.cache_state import CacheStateManager, mark_scope_scraped
 from comet.services.debrid import DebridService, prefer_torrent_update
@@ -62,12 +63,10 @@ from comet.services.debrid_account_scraper import (
     schedule_account_snapshot_refresh,
 )
 from comet.services.filtering import (
-    apply_release_candidate_policy,
-    normalize_release_candidates,
+    normalize_release_candidates_with_stats,
     release_normalization_fingerprint,
 )
 from comet.services.orchestration import TorrentResultAccumulator
-from comet.services.ranking import sort_candidates
 from comet.usenet.access import NativeAccessAuthorizer
 from comet.utils.http_client import http_client_manager
 from comet.utils.parsing import MediaScope, parse_media_id, resolve_media_scope
@@ -93,7 +92,6 @@ class MediaSearchResult:
     aliases: dict = field(default_factory=dict)
     media_scope: MediaScope | None = None
     torrents: dict = field(default_factory=dict)
-    ranked_info_hashes: list[str] = field(default_factory=list)
     service_cache_status: dict = field(default_factory=dict)
     debrid_errors: dict = field(default_factory=dict)
     cache_state: str = "unknown"
@@ -111,6 +109,7 @@ class MediaSearchResult:
     )
     provider_capabilities: dict[tuple[str, str], str] = field(default_factory=dict)
     candidate_count: int = 0
+    pipeline: PipelineResult | None = None
 
 
 @dataclass(slots=True)
@@ -340,7 +339,7 @@ async def _search_configured_sources(
     aliases = {} if aliases is None else aliases
 
     async def normalize_candidates(candidates: tuple[ReleaseCandidate, ...]):
-        return await normalize_release_candidates(
+        return await normalize_release_candidates_with_stats(
             candidates,
             title=title,
             year=year,
@@ -348,6 +347,9 @@ async def _search_configured_sources(
             media_type=media_type,
             aliases=aliases,
             content_id=media_id,
+            collect_rejections=(
+                config["_resultsModel"].auxiliary.filterSummary != "off"
+            ),
         )
 
     normalization_fingerprint = (
@@ -396,7 +398,7 @@ async def _search_configured_sources(
     return replace(result, diagnostics=diagnostics)
 
 
-async def _filter_and_rank_discovery_candidates(
+async def _normalize_discovery_candidates(
     candidates: tuple,
     *,
     title: str,
@@ -406,22 +408,32 @@ async def _filter_and_rank_discovery_candidates(
     aliases: dict[str, list[str]],
     content_id: str,
     remove_adult_content: bool,
-    config: Mapping[str, Any],
-) -> tuple:
-    """Apply request policy and ranking to normalized discovery candidates."""
+    found_count: int | None = None,
+    rejection_counts: tuple[tuple[str, int], ...] = (),
+    collect_rejections: bool,
+) -> CandidateNormalizationResult:
+    """Apply non-bypassable correctness guards before result policy."""
+    total = len(candidates) if found_count is None else found_count
+    counts = dict(rejection_counts) if collect_rejections else None
     if not candidates:
-        return ()
+        return CandidateNormalizationResult((), total, tuple((counts or {}).items()))
     if not settings.INDEXER_PRIVATE_TORRENTS_ENABLED:
+        if counts is not None:
+            count = sum(candidate.is_private for candidate in candidates)
+            if count:
+                counts["private"] = counts.get("private", 0) + count
         candidates = tuple(
             candidate for candidate in candidates if not candidate.is_private
         )
         if not candidates:
-            return ()
+            return CandidateNormalizationResult(
+                (), total, tuple((counts or {}).items())
+            )
     legacy_candidates = tuple(
         candidate for candidate in candidates if candidate.parsed is None
     )
     if legacy_candidates:
-        normalized_legacy = await normalize_release_candidates(
+        normalized = await normalize_release_candidates_with_stats(
             legacy_candidates,
             title=title,
             year=year,
@@ -429,25 +441,27 @@ async def _filter_and_rank_discovery_candidates(
             media_type=media_type,
             aliases=aliases,
             content_id=content_id,
+            collect_rejections=collect_rejections,
         )
+        if counts is not None:
+            for reason, count in normalized.rejection_counts:
+                counts[reason] = counts.get(reason, 0) + count
         candidates = (
             tuple(candidate for candidate in candidates if candidate.parsed is not None)
-            + normalized_legacy
+            + normalized.candidates
         )
-    filtered = apply_release_candidate_policy(
+    if remove_adult_content:
+        if counts is not None:
+            count = sum(candidate.parsed.adult for candidate in candidates)
+            if count:
+                counts["adult"] = counts.get("adult", 0) + count
+        candidates = tuple(
+            candidate for candidate in candidates if not candidate.parsed.adult
+        )
+    return CandidateNormalizationResult(
         candidates,
-        remove_adult_content=remove_adult_content,
-    )
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        get_executor(),
-        sort_candidates,
-        filtered,
-        config["rtnSettings"],
-        config["rtnRanking"],
-        0,
-        config["maxSize"],
-        config["removeTrash"],
+        total,
+        tuple((reason, count) for reason, count in (counts or {}).items() if count),
     )
 
 
@@ -467,18 +481,20 @@ def _coalesce_private_torrent_candidates(candidates: tuple) -> tuple:
     )
 
 
-async def _apply_private_torrent_result_policy(torrents: dict) -> None:
+async def _apply_private_torrent_result_policy(torrents: dict) -> int:
     if not torrents:
-        return
+        return 0
     private_hashes = await TorrentReleaseRepository(database).private_hashes(
         tuple(torrents)
     )
     if settings.INDEXER_PRIVATE_TORRENTS_ENABLED:
         for info_hash in private_hashes:
             torrents[info_hash]["isPrivate"] = True
+        return 0
     else:
         for info_hash in private_hashes:
             del torrents[info_hash]
+        return len(private_hashes)
 
 
 async def _persist_rendered_candidates(
@@ -491,32 +507,10 @@ async def _persist_rendered_candidates(
     )
 
 
-def _apply_torrent_cache_facts(
-    options: tuple[ProviderOption, ...],
-    service_cache_status: Mapping[str, Mapping[str, bool]],
-) -> tuple[ProviderOption, ...]:
-    """Attach current exact debrid cache facts without inferring readiness."""
-    resolved = []
-    for option in options:
-        if (
-            option.provider.kind not in TORRENT_PROVIDER_KINDS
-            or option.provider.kind == "direct_torrent"
-        ):
-            resolved.append(option)
-            continue
-        info_hash = option.candidate_id.removeprefix("btih:")
-        cached = service_cache_status.get(info_hash, {}).get(
-            option.provider.configuration_id,
-            False,
-        )
-        resolved.append(replace(option, cached=True) if cached else option)
-    return tuple(resolved)
-
-
 def _issue_provider_capabilities(
     codec: CapabilityCodec,
     partition: bytes,
-    options: tuple[ProviderOption, ...],
+    entries: tuple,
     persisted_candidates: Mapping[str, RenderedCandidateIds],
     *,
     media_type: str,
@@ -525,14 +519,33 @@ def _issue_provider_capabilities(
 ) -> dict[tuple[str, str], str]:
     selection_intent = [0] if media_type == "movie" else [1, season or 0, episode or 0]
     capabilities = {}
-    for option in options:
+    for entry in entries:
+        option = entry.option
         if option.provider.kind in {"direct_torrent", "stremio_nntp"}:
             continue
         persisted = persisted_candidates.get(option.candidate_id)
         if persisted is None:
             continue
-        capabilities[(option.candidate_id, option.provider.configuration_id)] = (
-            issue_provider_option_capability(
+        fallback_options = tuple(
+            candidate
+            for candidate in entry.fallback_options
+            if candidate.provider.kind not in {"direct_torrent", "stremio_nntp"}
+        )[:2]
+        chain = (option, *fallback_options)
+        if len(chain) > 1:
+            capability = issue_fallback_option_capability(
+                codec,
+                partition=partition,
+                options=chain,
+                persisted=persisted,
+                transport=(
+                    "bittorrent" if entry.facts.transport == "torrent" else "usenet"
+                ),
+                selection_intent=selection_intent,
+                client="stremio",
+            )
+        else:
+            capability = issue_provider_option_capability(
                 codec,
                 partition=partition,
                 option=option,
@@ -540,62 +553,77 @@ def _issue_provider_capabilities(
                 selection_intent=selection_intent,
                 client="stremio",
             )
+        capabilities[(option.candidate_id, option.provider.configuration_id)] = (
+            capability
         )
     return capabilities
 
 
 async def _prepare_provider_view(
     config: Mapping[str, Any],
-    candidates: tuple[ReleaseCandidate, ...],
+    prepared: PreparedReleases,
     capability_plan: CapabilityPlan,
     service_cache_status: Mapping[str, Mapping[str, bool]],
     *,
+    failed_provider_ids: frozenset[str] = frozenset(),
     media_type: str,
     season: int | None,
     episode: int | None,
     season_norm: int,
     episode_norm: int,
 ) -> tuple[
-    tuple[ReleaseCandidate, ...],
-    tuple[ProviderOption, ...],
+    PipelineResult,
     dict[str, RenderedCandidateIds],
     dict[tuple[str, str], str],
 ]:
     """Persist and expose one provider-expanded mixed candidate view."""
-    provider_options = build_provider_options(candidates, capability_plan)
-    provider_options = _apply_torrent_cache_facts(
-        provider_options,
-        service_cache_status,
+    provider_names = {
+        entry["configurationId"]: entry.get("displayName") or entry["kind"]
+        for entry in config.get("playbackProviders") or ()
+    }
+    provider_names.update(
+        {
+            entry.get("configurationId", entry["service"]): entry["service"]
+            for entry in config["_debridEntries"]
+        }
     )
-    candidates, provider_options = select_presentation(
-        candidates,
-        provider_options,
-        cached_only=config["cachedOnly"],
-        max_releases_per_resolution=config["maxResultsPerResolution"],
+    provider_names.setdefault("direct_torrent", "Torrent")
+    pipeline = finalize_results(
+        prepared,
+        capability_plan=capability_plan,
+        service_cache_status=service_cache_status,
+        failed_provider_ids=failed_provider_ids,
+        provider_names=provider_names,
+        results=config["_resultsModel"],
+        languages=config["_languagesModel"],
+        policy=config["_releasePolicy"],
         season_norm=season_norm,
         episode_norm=episode_norm,
     )
     rendered_candidate_ids = {}
     provider_capabilities = {}
-    if candidates and settings.COMET_CAPABILITY_SECRET:
+    if (
+        config["schemaVersion"] == 2
+        and pipeline.candidates
+        and settings.COMET_CAPABILITY_SECRET
+    ):
         codec = CapabilityCodec(settings.COMET_CAPABILITY_SECRET)
         partition = codec.configuration_partition_for_config(config)
         rendered_candidate_ids = await _persist_rendered_candidates(
-            candidates,
+            pipeline.candidates,
             partition,
         )
         provider_capabilities = _issue_provider_capabilities(
             codec,
             partition,
-            provider_options,
+            pipeline.entries,
             rendered_candidate_ids,
             media_type=media_type,
             season=season,
             episode=episode,
         )
     return (
-        candidates,
-        provider_options,
+        pipeline,
         rendered_candidate_ids,
         provider_capabilities,
     )
@@ -618,7 +646,7 @@ async def _prepare_discovery_only_view(
     episode_norm: int,
 ):
     """Build the independent Usenet view when the torrent branch cannot proceed."""
-    candidates = await _filter_and_rank_discovery_candidates(
+    normalized = await _normalize_discovery_candidates(
         _coalesce_private_torrent_candidates(discovery_result.candidates),
         title=title,
         year=year,
@@ -627,11 +655,28 @@ async def _prepare_discovery_only_view(
         aliases=aliases,
         content_id=content_id,
         remove_adult_content=remove_adult_content,
-        config=config,
+        found_count=discovery_result.found_count,
+        rejection_counts=discovery_result.rejection_counts,
+        collect_rejections=(config["_resultsModel"].auxiliary.filterSummary != "off"),
+    )
+    if isinstance(normalized, tuple):
+        normalized = CandidateNormalizationResult(
+            normalized,
+            discovery_result.found_count or len(normalized),
+            discovery_result.rejection_counts,
+        )
+    prepared = prepare_releases(
+        normalized.candidates,
+        policy=config["_releasePolicy"],
+        rtn_settings=config["rtnSettings"],
+        rtn_ranking=config["rtnRanking"],
+        summary_enabled=config["_resultsModel"].auxiliary.filterSummary != "off",
+        found_count=normalized.found_count,
+        guard_rejection_counts=normalized.rejection_counts,
     )
     return await _prepare_provider_view(
         config,
-        candidates,
+        prepared,
         discovery_result.capability_plan,
         {},
         media_type=media_type,
@@ -1219,7 +1264,7 @@ async def _search_media(
             add_background_task=add_background_task,
         )
     )
-    remove_adult_content = settings.REMOVE_ADULT_CONTENT and config["removeTrash"]
+    remove_adult_content = settings.REMOVE_ADULT_CONTENT
 
     # Metadata remains useful to every transport, but the legacy torrent
     # manager owns cache/scraper/debrid side effects and must not run for a
@@ -1227,8 +1272,7 @@ async def _search_media(
     if not bittorrent_enabled:
         discovery_result = await discovery_task
         (
-            candidates,
-            provider_options,
+            pipeline,
             rendered_candidate_ids,
             provider_capabilities,
         ) = await _prepare_discovery_only_view(
@@ -1257,12 +1301,13 @@ async def _search_media(
             search_episode=search_episode,
             is_torrent_only=False,
             use_account_scrape=False,
-            candidates=candidates,
+            candidates=pipeline.candidates,
             discovery_diagnostics=discovery_result.diagnostics,
-            provider_options=provider_options,
+            provider_options=pipeline.options,
             rendered_candidate_ids=rendered_candidate_ids,
             provider_capabilities=provider_capabilities,
-            candidate_count=len(candidates),
+            candidate_count=len(pipeline.candidates),
+            pipeline=pipeline,
         )
 
     cache_media_ids = [media_only_id]
@@ -1286,6 +1331,11 @@ async def _search_media(
         has_debrid=bool(debrid_entries),
         enable_torrent=enable_torrent,
     )
+    results_model = config.get("_resultsModel")
+    summary_enabled = (
+        getattr(getattr(results_model, "auxiliary", None), "filterSummary", "off")
+        != "off"
+    )
     torrent_manager = TorrentResultAccumulator(
         media_type,
         media_id,
@@ -1305,6 +1355,7 @@ async def _search_media(
         reject_unknown_episode_files=reject_unknown_episode_files,
         media_scope=media_scope,
         cache_task_adder=add_background_task,
+        summary_enabled=summary_enabled,
     )
 
     await torrent_manager.get_cached_torrents()
@@ -1356,7 +1407,7 @@ async def _search_media(
     discovery_candidates = _coalesce_private_torrent_candidates(
         discovery_result.candidates
     )
-    candidates = await _filter_and_rank_discovery_candidates(
+    normalized_discovery = await _normalize_discovery_candidates(
         discovery_candidates,
         title=title,
         year=year,
@@ -1365,8 +1416,17 @@ async def _search_media(
         aliases=aliases,
         content_id=media_id,
         remove_adult_content=remove_adult_content,
-        config=config,
+        found_count=discovery_result.found_count,
+        rejection_counts=discovery_result.rejection_counts,
+        collect_rejections=summary_enabled,
     )
+    if isinstance(normalized_discovery, tuple):
+        normalized_discovery = CandidateNormalizationResult(
+            normalized_discovery,
+            discovery_result.found_count or len(normalized_discovery),
+            discovery_result.rejection_counts,
+        )
+    candidates = normalized_discovery.candidates
     await torrent_manager.ingest_release_candidates(
         "configured-discovery", discovery_candidates
     )
@@ -1419,7 +1479,70 @@ async def _search_media(
             if existing_parsed is None or existing_parsed.resolution == "unknown":
                 existing_torrent["parsed"] = account_torrent["parsed"]
 
-    await _apply_private_torrent_result_policy(torrent_manager.torrents)
+    private_torrents_rejected = await _apply_private_torrent_result_policy(
+        torrent_manager.torrents
+    )
+    torrent_manager._reject_guard("private", private_torrents_rejected)
+
+    torrent_candidates = tuple(
+        torrent_candidate_from_runtime(
+            info_hash,
+            torrent,
+            media_id=media_only_id,
+            scope=ReleaseScope(presentation_scope),
+            season_norm=presentation_season,
+            episode_norm=presentation_episode,
+        )
+        for info_hash, torrent in sorted(torrent_manager.torrents.items())
+    )
+    torrent_ids = {candidate.candidate_id for candidate in torrent_candidates}
+    combined_candidates = torrent_candidates + tuple(
+        candidate
+        for candidate in candidates
+        if candidate.candidate_id not in torrent_ids
+    )
+    guard_counts = normalized_discovery.rejection_counts
+    torrent_guard_counts = getattr(torrent_manager, "guard_rejection_counts", None)
+    if summary_enabled and isinstance(torrent_guard_counts, dict):
+        merged_counts = dict(guard_counts)
+        for reason, count in torrent_guard_counts.items():
+            merged_counts[reason] = merged_counts.get(reason, 0) + count
+        guard_counts = tuple(merged_counts.items())
+    configured_torrent_ids = {
+        candidate_id
+        for candidate in discovery_candidates
+        if (candidate_id := getattr(candidate, "candidate_id", "")).startswith("btih:")
+    }
+    legacy_survivors = sum(
+        candidate.candidate_id not in configured_torrent_ids
+        for candidate in torrent_candidates
+    )
+    torrent_found_count = getattr(torrent_manager, "found_count", 0)
+    if type(torrent_found_count) is not int:
+        torrent_found_count = legacy_survivors
+    prepared = prepare_releases(
+        combined_candidates,
+        policy=config["_releasePolicy"],
+        rtn_settings=config["rtnSettings"],
+        rtn_ranking=config["rtnRanking"],
+        summary_enabled=summary_enabled,
+        found_count=(
+            max(
+                torrent_found_count,
+                legacy_survivors + private_torrents_rejected,
+            )
+            + normalized_discovery.found_count
+        ),
+        guard_rejection_counts=guard_counts,
+    )
+    accepted_candidate_ids = {
+        release.candidate.candidate_id for release in prepared.releases
+    }
+    torrent_manager.torrents = {
+        info_hash: torrent
+        for info_hash, torrent in torrent_manager.torrents.items()
+        if f"btih:{info_hash}" in accepted_candidate_ids
+    }
 
     if debrid_entries:
         existing_service_cache_status = await check_multi_service_availability(
@@ -1478,79 +1601,59 @@ async def _search_media(
         )
         merge_service_cache_status(service_cache_status, fresh_service_cache_status)
 
-    await torrent_manager.rank_torrents(
-        config["rtnSettings"],
-        config["rtnRanking"],
-        0,
-        config["maxSize"],
-        config["removeTrash"],
-    )
-
-    provider_options = ()
-    rendered_candidate_ids = {}
-    provider_capabilities = {}
-    ranked_info_hashes = torrent_manager.ranked_torrents
-    if config["schemaVersion"] == 2:
-        torrent_candidates = tuple(
-            torrent_candidate_from_runtime(
-                info_hash,
-                torrent_manager.torrents[info_hash],
-                media_id=media_only_id,
-                scope=ReleaseScope(presentation_scope),
-                season_norm=presentation_season,
-                episode_norm=presentation_episode,
-            )
-            for info_hash in ranked_info_hashes
-        )
-        torrent_ids = {candidate.candidate_id for candidate in torrent_candidates}
-        candidates = torrent_candidates + tuple(
-            candidate
-            for candidate in candidates
-            if candidate.candidate_id not in torrent_ids
-        )
-        candidates = await asyncio.get_running_loop().run_in_executor(
-            get_executor(),
-            sort_candidates,
-            candidates,
-            config["rtnSettings"],
-            config["rtnRanking"],
-            0,
-            config["maxSize"],
-            config["removeTrash"],
-        )
-        ranked_info_hashes = [
-            candidate.candidate_id.removeprefix("btih:")
-            for candidate in candidates
-            if candidate.candidate_id.startswith("btih:")
-        ]
-        (
-            candidates,
-            provider_options,
-            rendered_candidate_ids,
-            provider_capabilities,
-        ) = await _prepare_provider_view(
-            config,
-            candidates,
-            discovery_result.capability_plan,
-            service_cache_status,
-            media_type=media_type,
-            season=search_season,
-            episode=search_episode,
+    refreshed_torrents = tuple(
+        torrent_candidate_from_runtime(
+            info_hash,
+            torrent,
+            media_id=media_only_id,
+            scope=ReleaseScope(presentation_scope),
             season_norm=presentation_season,
             episode_norm=presentation_episode,
         )
-        visible_candidate_ids = {candidate.candidate_id for candidate in candidates}
-        ranked_info_hashes = [
-            info_hash
-            for info_hash in ranked_info_hashes
-            if f"btih:{info_hash}" in visible_candidate_ids
-        ]
+        for info_hash, torrent in sorted(torrent_manager.torrents.items())
+    )
+    refreshed_ids = {candidate.candidate_id for candidate in refreshed_torrents}
+    refreshed_candidates = refreshed_torrents + tuple(
+        candidate
+        for candidate in candidates
+        if candidate.candidate_id not in refreshed_ids
+    )
+    prepared = refresh_late_facts(
+        prepared,
+        refreshed_candidates,
+        policy=config["_releasePolicy"],
+    )
+    (
+        pipeline,
+        rendered_candidate_ids,
+        provider_capabilities,
+    ) = await _prepare_provider_view(
+        config,
+        prepared,
+        discovery_result.capability_plan,
+        service_cache_status,
+        failed_provider_ids=frozenset(debrid_errors),
+        media_type=media_type,
+        season=search_season,
+        episode=search_episode,
+        season_norm=presentation_season,
+        episode_norm=presentation_episode,
+    )
+    candidates = pipeline.candidates
+    provider_options = pipeline.options
+    visible_info_hashes = list(
+        dict.fromkeys(
+            entry.facts.candidate_id.removeprefix("btih:")
+            for entry in pipeline.entries
+            if entry.facts.candidate_id.startswith("btih:")
+        )
+    )
 
     return MediaSearchResult(
         (
             MediaSearchStatus.BUSY
             if torrent_discovery_inflight
-            and not ranked_info_hashes
+            and not visible_info_hashes
             and not provider_options
             else MediaSearchStatus.OK
         ),
@@ -1558,7 +1661,6 @@ async def _search_media(
         aliases=aliases,
         media_scope=media_scope,
         torrents=torrent_manager.torrents,
-        ranked_info_hashes=ranked_info_hashes,
         service_cache_status=service_cache_status,
         debrid_errors=debrid_errors,
         cache_state=cache_state,
@@ -1573,7 +1675,6 @@ async def _search_media(
         provider_options=provider_options,
         rendered_candidate_ids=rendered_candidate_ids,
         provider_capabilities=provider_capabilities,
-        candidate_count=(
-            len(candidates) if config["schemaVersion"] == 2 else len(ranked_info_hashes)
-        ),
+        candidate_count=(len(candidates)),
+        pipeline=pipeline,
     )

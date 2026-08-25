@@ -32,7 +32,9 @@ import {
   formValues,
 } from "./model";
 import { PlaybackStep } from "./PlaybackStep";
-import { LanguageStep, PreferencesStep } from "./PreferencesStep";
+import { LanguageStep } from "./PreferencesStep";
+import { ResultsPortability } from "./ResultsPortability";
+import { ResultsStep } from "./ResultsStep";
 import { ReviewStep } from "./ReviewStep";
 import { UsenetStep } from "./UsenetStep";
 
@@ -110,7 +112,7 @@ function Configurator({
   loaded?: ConfigModel;
 }) {
   const { t } = useTranslation();
-  const loaded = initialLoaded;
+  const [loaded, setLoaded] = useState(initialLoaded);
   const [activeSection, setActiveSection] = useState<ConfigureSection>("playback");
   const [busy, setBusy] = useState(false);
   const [capabilityResults, setCapabilityResults] = useState<
@@ -134,6 +136,7 @@ function Configurator({
   const {
     formState: { isDirty },
     getValues,
+    reset,
     setValue,
     watch,
   } = useForm<ConfigureFormValues>({
@@ -353,11 +356,28 @@ function Configurator({
                     sources={values.usenetSources}
                   />
                 ) : activeSection === "results" ? (
-                  <PreferencesStep
+                  <ResultsStep
                     bootstrap={bootstrap}
-                    onChange={change}
-                    showDebridOptions={hasConfiguredDebridService}
-                    values={values}
+                    configuredDebridKinds={[
+                      ...new Set(
+                        values.debridServices
+                          .filter(({ service }) => service !== DIRECT_TORRENT_SERVICE)
+                          .map(({ service }) => service),
+                      ),
+                    ]}
+                    onChange={(results) => change("results", results)}
+                    portability={
+                      <ResultsPortability
+                        configuration={configurationDocument(values, bootstrap, loaded)}
+                        onImport={async (configuration) => {
+                          const normalized = await validateConfiguration(configuration);
+                          setLoaded(normalized);
+                          reset(formValues(normalized, bootstrap));
+                        }}
+                      />
+                    }
+                    results={values.results}
+                    showDebridSync={values.scrapeDebridAccountTorrents}
                   />
                 ) : (
                   <LanguageStep bootstrap={bootstrap} onChange={change} values={values} />

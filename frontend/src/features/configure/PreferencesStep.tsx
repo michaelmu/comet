@@ -1,137 +1,14 @@
 import { useTranslation } from "react-i18next";
 import type { ConfiguratorBootstrapData } from "../../api/generated/contracts";
-import { Input } from "../../components/ui/Input";
 import { MultiSelect, type MultiSelectOption } from "../../components/ui/MultiSelect";
-import { Switch } from "../../components/ui/Switch";
+import { Select } from "../../components/ui/Select";
 import type { ConfigureFormValues } from "./model";
+import { ReorderableList } from "./ReorderableList";
 
 type ChangeConfiguration = <Key extends keyof ConfigureFormValues>(
   key: Key,
   value: ConfigureFormValues[Key],
 ) => void;
-
-export function PreferencesStep({
-  bootstrap,
-  onChange,
-  showDebridOptions,
-  values,
-}: {
-  bootstrap: ConfiguratorBootstrapData;
-  onChange: ChangeConfiguration;
-  showDebridOptions: boolean;
-  values: ConfigureFormValues;
-}) {
-  const { t } = useTranslation();
-  const resolutionOptions: MultiSelectOption[] = bootstrap.resolutions.map((resolution) => ({
-    label: resolution.replace(/^r/, ""),
-    value: resolution,
-  }));
-  const resultFieldOptions: MultiSelectOption[] = bootstrap.result_formats.map((field) => ({
-    label: t(`configure.resultFields.${field}`),
-    value: field,
-  }));
-  return (
-    <section className="configuration-fields">
-      <MultiSelect
-        className="multi-select-field--wide"
-        emptyLabel={t("configure.results.noneSelected")}
-        label={t("configure.results.resolutions")}
-        onChange={(resolutions) => onChange("resolutions", resolutions)}
-        options={resolutionOptions}
-        removeLabel={(label) => t("actions.removeSelection", { label })}
-        searchLabel={t("configure.results.searchResolutions")}
-        searchable={false}
-        selected={values.resolutions}
-      />
-      <div className="field-grid">
-        <Input
-          label={t("configure.results.maxPerResolution")}
-          min={0}
-          onChange={(event) => onChange("maxResultsPerResolution", event.target.valueAsNumber)}
-          type="number"
-          value={values.maxResultsPerResolution}
-        />
-        <Input
-          label={t("configure.results.maxSize")}
-          min={0}
-          onChange={(event) => onChange("maxSizeGb", event.target.valueAsNumber)}
-          step="0.1"
-          type="number"
-          value={values.maxSizeGb}
-        />
-      </div>
-      <MultiSelect
-        className="multi-select-field--wide"
-        emptyLabel={t("configure.results.noneSelected")}
-        label={t("configure.results.fields")}
-        onChange={(resultFormat) => onChange("resultFormat", resultFormat)}
-        options={resultFieldOptions}
-        removeLabel={(label) => t("actions.removeSelection", { label })}
-        searchLabel={t("configure.results.searchFields")}
-        searchable={false}
-        selected={values.resultFormat}
-      />
-      <ResultFormatPreview
-        emptyLabel={t("configure.results.emptyPreview")}
-        selected={values.resultFormat}
-      />
-      <div className="switch-list">
-        {showDebridOptions ? (
-          <Switch
-            checked={values.cachedOnly}
-            label={t("configure.results.cachedOnly")}
-            onCheckedChange={(checked) => onChange("cachedOnly", checked)}
-          />
-        ) : null}
-        <Switch
-          checked={values.removeTrash}
-          label={t("configure.results.filters")}
-          onCheckedChange={(checked) => onChange("removeTrash", checked)}
-        />
-        <Switch
-          checked={values.allowEnglishInLanguages}
-          label={t("configure.results.allowEnglish")}
-          onCheckedChange={(checked) => onChange("allowEnglishInLanguages", checked)}
-        />
-        <Switch
-          checked={values.removeUnknownLanguages}
-          label={t("configure.results.removeUnknown")}
-          onCheckedChange={(checked) => onChange("removeUnknownLanguages", checked)}
-        />
-      </div>
-    </section>
-  );
-}
-
-function ResultFormatPreview({ emptyLabel, selected }: { emptyLabel: string; selected: string[] }) {
-  const { t } = useTranslation();
-  const previewFields: Readonly<Record<string, string>> = {
-    audio_info: t("configure.preview.audio"),
-    languages: t("configure.preview.languages"),
-    quality_info: t("configure.preview.quality"),
-    release_group: t("configure.preview.releaseGroup"),
-    seeders: t("configure.preview.seeders"),
-    size: t("configure.preview.size"),
-    subtitles: t("configure.preview.subtitles"),
-    title: t("configure.preview.title"),
-    tracker: t("configure.preview.tracker"),
-    video_info: t("configure.preview.video"),
-  };
-  const field = (name: string) => (selected.includes(name) ? previewFields[name] : undefined);
-  const lines = [
-    field("title"),
-    [field("video_info"), field("audio_info")].filter(Boolean).join(" | "),
-    [field("quality_info"), field("release_group")].filter(Boolean).join(" | "),
-    [field("seeders"), field("size"), field("tracker")].filter(Boolean).join(" · "),
-    field("languages"),
-    field("subtitles"),
-  ].filter(Boolean);
-  return (
-    <figure className="result-preview">
-      <pre>{lines.join("\n") || emptyLabel}</pre>
-    </figure>
-  );
-}
 
 export function LanguageStep({
   bootstrap,
@@ -150,11 +27,11 @@ export function LanguageStep({
     label: `${emoji} ${code === "multi" ? t("configure.languages.multi") : (languageNames.of(code) ?? code)}`,
     value: code,
   }));
+  const optionByValue = new Map(options.map((option) => [option.value, option]));
   const fields = [
     ["requiredLanguages", "required"],
     ["allowedLanguages", "allowed"],
     ["excludedLanguages", "excluded"],
-    ["preferredLanguages", "preferred"],
   ] as const;
 
   return (
@@ -171,6 +48,41 @@ export function LanguageStep({
           selected={values[key]}
         />
       ))}
+      <div className="ordered-selection">
+        <MultiSelect
+          emptyLabel={t("configure.languages.none")}
+          label={t("configure.languages.preferred")}
+          onChange={(preferredLanguages) => onChange("preferredLanguages", preferredLanguages)}
+          options={options}
+          removeLabel={(optionLabel) => t("actions.removeSelection", { label: optionLabel })}
+          searchLabel={t("configure.languages.search")}
+          selected={values.preferredLanguages}
+        />
+        {values.preferredLanguages.length > 1 ? (
+          <ReorderableList
+            className="ordered-selection__list"
+            getId={(code) => code}
+            getLabel={(code) => optionByValue.get(code)?.label ?? code}
+            items={values.preferredLanguages}
+            label={t("configure.resultsEditor.reorderLanguages")}
+            onChange={(preferredLanguages) => onChange("preferredLanguages", preferredLanguages)}
+            renderItem={(code, _index, reorder) => (
+              <div className="ordered-selection__row">
+                {reorder.handle}
+                <span>{optionByValue.get(code)?.label ?? code}</span>
+              </div>
+            )}
+          />
+        ) : null}
+      </div>
+      <Select
+        label={t("configure.resultsEditor.unknownLanguage")}
+        onValueChange={(unknown) => onChange("unknownLanguages", unknown as "allow" | "exclude")}
+        value={values.unknownLanguages}
+      >
+        <option value="allow">{t("configure.resultsEditor.allow")}</option>
+        <option value="exclude">{t("configure.resultsEditor.exclude")}</option>
+      </Select>
     </section>
   );
 }

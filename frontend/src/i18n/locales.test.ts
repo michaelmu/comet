@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RESULT_ENUM_IDS, RESULT_FIELD_IDS } from "../api/generated/contracts";
 import english from "./locales/en.json";
 
 const translations = import.meta.glob("./locales/*.json", {
@@ -33,6 +34,31 @@ function variables(message: string): string[] {
 }
 
 describe("translations", () => {
+  it("translates every canonical bootstrap result field in every locale", () => {
+    for (const [path, translation] of Object.entries(translations)) {
+      const localizedKeys = new Set(keys(translation));
+      for (const field of RESULT_FIELD_IDS) {
+        expect(localizedKeys.has(`configure.resultFields.${field}`), `${path}: ${field}`).toBe(
+          true,
+        );
+      }
+    }
+  });
+
+  it("translates every result editor enum and contains no retired preset", () => {
+    for (const [path, translation] of Object.entries(translations)) {
+      const localizedKeys = new Set(keys(translation));
+      for (const value of RESULT_ENUM_IDS) {
+        expect(
+          localizedKeys.has(`configure.resultsEditor.values.${value}`),
+          `${path}: ${value}`,
+        ).toBe(true);
+      }
+      expect(localizedKeys.has("configure.resultsEditor.preset.qualitySeeders"), path).toBe(true);
+      expect(localizedKeys.has("configure.resultsEditor.preset.torrentio"), path).toBe(false);
+    }
+  });
+
   it("keeps every locale in parity with English", () => {
     const englishKeys = keys(english).sort();
 

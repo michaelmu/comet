@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import base64
 import secrets
-from typing import Annotated, Any
+from functools import cache
+from typing import Annotated, Any, get_args
 
 import orjson
 from fastapi import APIRouter, Cookie, Depends, Query, Request
@@ -27,6 +28,8 @@ from comet.api.v1.contracts import (
     ConfigureSessionData,
     ConfigValidationRequest,
     LoginRequest,
+    ResultsPreviewData,
+    ResultsPreviewRequest,
     SessionData,
     SettingsMutationData,
     SettingsMutationRequest,
@@ -67,7 +70,6 @@ from comet.core.models import (
     native_usenet_offered,
     native_usenet_sources,
     settings,
-    web_config,
 )
 from comet.core.operator_settings import (
     deployment_setting_keys,
@@ -77,6 +79,22 @@ from comet.core.operator_store import OperatorSettingsStore
 from comet.core.settings_catalog import build_settings_catalog
 from comet.core.sources import USENET_PLAYBACK_PROVIDER_KINDS
 from comet.observability.logging import current_settings
+from comet.results.config import (
+    RESULT_POLICY_FIELDS,
+    RESULT_SCOPES,
+    RESULT_SORT_KEYS,
+    RESULT_SORT_VOCABULARY,
+    SORT_PRESETS,
+    DisplayConfig,
+    ResultsConfig,
+)
+from comet.results.facts import FACT_VOCABULARY
+from comet.results.formatting import (
+    FIELD_REGISTRY,
+    TemplateSyntaxError,
+    compile_display,
+    example_context,
+)
 from comet.services.operator_commands import dispatch_settings_apply
 from comet.utils.languages import LANGUAGE_EMOJIS
 
@@ -358,6 +376,21 @@ async def configure_session(
     )
 
 
+@cache
+def _display_preset_previews() -> dict[str, ResultsPreviewData]:
+    """Render the fixed presets once so switching preset never waits on a request."""
+    context = example_context()
+    previews = {}
+    for preset in get_args(DisplayConfig.model_fields["preset"].annotation):
+        if preset == "custom":
+            continue
+        rendered = compile_display(DisplayConfig(preset=preset)).render(context)
+        previews[preset] = ResultsPreviewData(
+            name=rendered.name, description=rendered.description
+        )
+    return previews
+
+
 @router.get(
     "/configure/bootstrap",
     response_model=ApiSuccess[ConfiguratorBootstrapData],
@@ -368,7 +401,8 @@ async def configure_bootstrap(
     _session_token: Annotated[str | None, Depends(require_configure_session)],
 ):
     default_configuration = ConfigModel(
-        enableTorrent=not settings.DISABLE_TORRENT_STREAMS
+        enableTorrent=not settings.DISABLE_TORRENT_STREAMS,
+        results=ResultsConfig(),
     )
     return success_response(
         request,
@@ -381,8 +415,25 @@ async def configure_bootstrap(
                 native_usenet=native_usenet_offered(settings),
                 stremio_api_prefix=settings.STREMIO_API_PREFIX,
             ),
-            resolutions=list(default_configuration.resolutions or {}),
-            result_formats=web_config["resultFormat"],
+            result_fields=[
+                identifier
+                for identifier, definition in FIELD_REGISTRY.items()
+                if definition.public
+            ],
+            result_sort_keys=list(RESULT_SORT_KEYS),
+            result_scopes=list(RESULT_SCOPES),
+            result_sort_presets={
+                name: [dict(criterion) for criterion in criteria]
+                for name, criteria in SORT_PRESETS.items()
+            },
+            result_sort_vocabulary={
+                key: list(values) for key, values in RESULT_SORT_VOCABULARY.items()
+            },
+            result_policy_fields=list(RESULT_POLICY_FIELDS),
+            result_facets={
+                key: list(values) for key, values in FACT_VOCABULARY.items()
+            },
+            result_display_presets=_display_preset_previews(),
             languages=LANGUAGE_EMOJIS,
             debrid_services=list(VALID_DEBRID_SERVICES),
             native_usenet_sources=list(native_usenet_sources(settings)),
@@ -406,6 +457,31 @@ async def validate_configuration(
     return success_response(
         request,
         body.configuration.model_dump(mode="json", exclude_unset=True),
+    )
+
+
+@router.post(
+    "/configure/results/preview",
+    response_model=ApiSuccess[ResultsPreviewData],
+    tags=["API v1 Configuration"],
+)
+async def preview_results(
+    request: Request,
+    body: ResultsPreviewRequest,
+    _session_token: Annotated[str | None, Depends(require_configure_csrf)],
+):
+    try:
+        rendered = compile_display(body.display).render(example_context())
+    except TemplateSyntaxError as exc:
+        raise ApiProblem(
+            status_code=422,
+            code="result_template_invalid",
+            message=str(exc),
+            details=[{"offset": exc.offset}],
+        ) from exc
+    return success_response(
+        request,
+        ResultsPreviewData(name=rendered.name, description=rendered.description),
     )
 
 

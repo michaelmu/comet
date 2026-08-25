@@ -1,6 +1,5 @@
 import time
 import uuid
-from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote
 
@@ -12,7 +11,6 @@ from comet.core.models import database, settings
 from comet.core.sources import (
     SERVER_USENET_PROVIDER_KINDS,
     LocatorKind,
-    ReleaseCandidate,
 )
 from comet.debrid.manager import get_debrid_extension
 from comet.observability import metrics
@@ -22,6 +20,9 @@ from comet.playback.providers.stremio_nntp import (
     handoff_selector,
 )
 from comet.playback.tokens import CapabilityCodec
+from comet.results.formatting import context_from_entry
+from comet.results.ordering import compose_auxiliary
+from comet.results.summary import render_filter_summary
 from comet.services.media_search import (
     MediaSearchResult,
     MediaSearchStatus,
@@ -31,12 +32,7 @@ from comet.services.trackers import trackers
 from comet.usenet.engine_client import EngineClient
 from comet.usenet.nzb_broker import NzbBroker, NzbBrokerError
 from comet.utils.cache import CachePolicies, cached_json_response
-from comet.utils.formatting import (
-    format_chilllink,
-    format_title,
-    get_formatted_components,
-    get_formatted_components_plain,
-)
+from comet.utils.formatting import format_chilllink
 from comet.utils.network import get_client_ip
 
 streams = APIRouter()
@@ -132,66 +128,6 @@ def _render_discovery_diagnostics(
     return streams
 
 
-def _build_stream_name(
-    kodi: bool,
-    service: str,
-    resolution: object,
-    icon: str = "",
-    formatted_components: dict | None = None,
-    seeders: int | None = None,
-    status: str = "",
-):
-    resolution = str(resolution).strip() if resolution else ""
-    if resolution.casefold() == "unknown":
-        resolution = ""
-    if not kodi:
-        return " ".join(
-            part for part in (f"[{service}{icon}]", "Comet", resolution) if part
-        )
-
-    prefix = " ".join(
-        part for part in (f"[{f'{service} {status}'.strip()}]", resolution) if part
-    )
-
-    if formatted_components is None:
-        return prefix
-
-    details = [
-        formatted_components.get("size", "").removeprefix("Size: "),
-        f"S:{seeders}" if seeders is not None else "",
-        formatted_components.get("video", ""),
-        formatted_components.get("audio", ""),
-        formatted_components.get("quality", ""),
-        formatted_components.get("group", ""),
-    ]
-    details = [d for d in details if d]
-    return f"{prefix} | {' | '.join(details)}" if details else prefix
-
-
-def _format_release(
-    parsed,
-    title: str,
-    *,
-    seeders: int | None,
-    size: int | None,
-    source: str,
-    result_format: list | tuple,
-    kodi: bool,
-    media_info=None,
-) -> tuple[dict, str]:
-    formatter = get_formatted_components_plain if kodi else get_formatted_components
-    components = formatter(
-        parsed,
-        title,
-        seeders,
-        size,
-        source,
-        result_format,
-        media_info,
-    )
-    return components, format_title(components)
-
-
 def _release_behavior_hints(
     *,
     binge_group: str,
@@ -217,45 +153,22 @@ def _release_behavior_hints(
     return hints
 
 
-def _candidate_presentation(
-    candidate: ReleaseCandidate,
-    config: dict,
-    *,
-    kodi: bool,
-):
-    parsed = candidate.parsed
-    title = candidate.title
-    size = candidate.size
-    source = candidate.source
-    result_format = config["resultFormat"]
-    components, description = _format_release(
-        parsed,
-        title,
-        seeders=None,
-        size=size,
-        source=source,
-        result_format=result_format,
-        kodi=kodi,
-        media_info=candidate.media_info,
-    )
-    if not components:
-        components, description = _format_release(
-            parsed,
-            title,
-            seeders=None,
-            size=size,
-            source=source,
-            result_format=("title",),
-            kodi=kodi,
-            media_info=candidate.media_info,
-        )
-    return (
-        parsed,
-        size,
-        parsed.resolution if parsed is not None else "",
-        components,
-        description,
-    )
+def _entry_presentation(entry, config: dict, *, kodi: bool):
+    rendered = config["_displayRenderer"].render(context_from_entry(entry, kodi=kodi))
+    fields = rendered.fields
+    components = {
+        "title": fields["title"],
+        "video": fields["video"],
+        "audio": fields["audio"],
+        "quality": fields["quality"],
+        "group": fields["releaseGroup"],
+        "seeders": fields["seeders"],
+        "size": fields["size"],
+        "tracker": fields["source"],
+        "languages": fields["languages.codes" if kodi else "languages.flags"],
+        "subtitles": fields["subtitles.codes" if kodi else "subtitles.flags"],
+    }
+    return rendered, {key: value for key, value in components.items() if value}
 
 
 def _usenet_chilllink_metadata(
@@ -302,11 +215,11 @@ def _render_server_usenet_options(
     kodi: bool = False,
 ) -> dict[tuple[str, str], dict]:
     """Render validated server-side providers with a committed v2 capability."""
-    candidates = {
-        candidate.candidate_id: candidate for candidate in search_result.candidates
-    }
     entries = {entry["configurationId"]: entry for entry in config["playbackProviders"]}
     streams = {}
+    result_entries = {
+        entry.stable_id: entry for entry in search_result.pipeline.entries
+    }
     for option in search_result.provider_options:
         if option.provider.kind not in SERVER_USENET_PROVIDER_KINDS:
             continue
@@ -315,31 +228,22 @@ def _render_server_usenet_options(
         )
         if capability is None:
             continue
-        candidate = candidates[option.candidate_id]
+        result_entry = result_entries[
+            (option.candidate_id, option.provider.configuration_id)
+        ]
+        candidate = result_entry.candidate
         entry = entries[option.provider.configuration_id]
-        provider_label = entry["displayName"]
-        parsed, size, resolution, components, description = _candidate_presentation(
-            candidate,
-            config,
-            kodi=kodi,
-        )
+        rendered, components = _entry_presentation(result_entry, config, kodi=kodi)
         stream = {
-            "name": _build_stream_name(
-                kodi,
-                provider_label,
-                resolution,
-                icon="📰",
-                formatted_components=components,
-                status="NZB",
-            ),
-            "description": description,
+            "name": rendered.name,
+            "description": rendered.description,
             "behaviorHints": _release_behavior_hints(
                 binge_group=(
                     f"comet|{option.provider.configuration_id}|{option.candidate_id}"
                 ),
                 filename=candidate.title,
-                size=size,
-                parsed=parsed,
+                size=result_entry.playback_size,
+                parsed=candidate.parsed,
                 formatted_components=components,
                 kodi=kodi,
                 media_info=candidate.media_info,
@@ -348,7 +252,7 @@ def _render_server_usenet_options(
         }
         if chilllink:
             stream["_chilllink"] = _usenet_chilllink_metadata(
-                provider_label,
+                entry["displayName"],
                 components,
             )
         streams[(option.candidate_id, option.provider.configuration_id)] = stream
@@ -378,8 +282,8 @@ async def _render_stremio_nntp_options(
         database,
         EngineClient(Path(settings.USENET_RUNTIME_DIR) / "engine.json"),
     )
-    candidates = {
-        candidate.candidate_id: candidate for candidate in search_result.candidates
+    result_entries = {
+        entry.stable_id: entry for entry in search_result.pipeline.entries
     }
     season = search_result.search_season
     episode = search_result.search_episode
@@ -411,7 +315,10 @@ async def _render_stremio_nntp_options(
         if option.provider.kind != "stremio_nntp":
             continue
         entry = entries[option.provider.configuration_id]
-        candidate = candidates[option.candidate_id]
+        result_entry = result_entries[
+            (option.candidate_id, option.provider.configuration_id)
+        ]
+        candidate = result_entry.candidate
         artifacts = [
             locator
             for locator in option.locators
@@ -477,86 +384,22 @@ async def _render_stremio_nntp_options(
                 )
         except NzbBrokerError:
             continue
-        provider_label = entry["displayName"]
-        parsed, size, resolution, components, description = _candidate_presentation(
-            candidate,
-            config,
-            kodi=kodi,
-        )
-        handoff["name"] = _build_stream_name(
-            kodi,
-            provider_label,
-            resolution,
-            icon="📰",
-            formatted_components=components,
-            status="NZB",
-        )
-        handoff["description"] = description
+        rendered, components = _entry_presentation(result_entry, config, kodi=kodi)
+        handoff["name"] = rendered.name
+        handoff["description"] = rendered.description
         handoff["behaviorHints"] = _release_behavior_hints(
             binge_group=(
                 f"comet|{option.provider.configuration_id}|{option.candidate_id}"
             ),
             filename=candidate.title,
-            size=size,
-            parsed=parsed,
+            size=result_entry.playback_size,
+            parsed=candidate.parsed,
             formatted_components=components,
             kodi=kodi,
             media_info=candidate.media_info,
         )
         streams[(option.candidate_id, option.provider.configuration_id)] = handoff
     return streams
-
-
-def _select_info_hashes_by_resolution(
-    ranked_info_hashes,
-    torrents: dict,
-    service_cache_status: dict,
-    max_results: int,
-    cached_only: bool,
-    prioritize_cached: bool,
-):
-    if max_results <= 0:
-        return None
-
-    per_resolution_count = defaultdict(int)
-    selected_info_hashes = []
-
-    def try_select(info_hash: str):
-        resolution = str(torrents[info_hash]["parsed"].resolution)
-        if per_resolution_count[resolution] >= max_results:
-            return
-        selected_info_hashes.append(info_hash)
-        per_resolution_count[resolution] += 1
-
-    is_cached_by_hash = {}
-    if prioritize_cached or cached_only:
-        is_cached_by_hash = {
-            info_hash: any(service_cache_status.get(info_hash, {}).values())
-            for info_hash in ranked_info_hashes
-        }
-
-    if prioritize_cached:
-        for info_hash in ranked_info_hashes:
-            if not is_cached_by_hash[info_hash]:
-                continue
-            try_select(info_hash)
-
-        if cached_only:
-            return selected_info_hashes
-
-        for info_hash in ranked_info_hashes:
-            if is_cached_by_hash[info_hash]:
-                continue
-            try_select(info_hash)
-
-        return selected_info_hashes
-
-    for info_hash in ranked_info_hashes:
-        if cached_only and not is_cached_by_hash[info_hash]:
-            continue
-        try_select(info_hash)
-
-    return selected_info_hashes
 
 
 @streams.get(
@@ -604,15 +447,21 @@ async def stream(
         return _build_stream_response(request, error_response, is_empty=True)
 
     debrid_entries = config["_debridEntries"]
-    enable_torrent = config["_enableTorrent"]
     is_v2 = config.get("schemaVersion") == 2
     use_account_scrape = bool(debrid_entries and config["scrapeDebridAccountTorrents"])
     response_cache_policy = CachePolicies.no_cache() if use_account_scrape else None
     stream_cache_state = "unknown"
     stream_client = "kodi" if kodi else ("chilllink" if chilllink else "stremio")
 
-    def _stream_response(content: dict, is_empty: bool = False):
-        result_count = len(content["streams"])
+    def _stream_response(
+        content: dict,
+        is_empty: bool = False,
+        *,
+        playable_count: int | None = None,
+    ):
+        result_count = (
+            len(content["streams"]) if playable_count is None else playable_count
+        )
         metrics.observe_stream(
             media_type,
             stream_client,
@@ -711,8 +560,6 @@ async def stream(
     media_only_id = search_result.media_only_id
     search_season = search_result.search_season
     search_episode = search_result.search_episode
-    service_cache_status = search_result.service_cache_status
-    debrid_errors = search_result.debrid_errors
     torrents = search_result.torrents
     debrid_labels = {
         entry.get("configurationId", entry["service"]): get_debrid_extension(
@@ -720,7 +567,7 @@ async def stream(
         )
         for entry in debrid_entries
     }
-    base_streams = [
+    error_streams = [
         {
             "name": (
                 f"[ERROR] {debrid_labels.get(provider_key, provider_key)}"
@@ -748,7 +595,7 @@ async def stream(
         and settings.PROXY_DEBRID_STREAM
         and settings.PROXY_DEBRID_STREAM_PASSWORD != config["debridStreamProxyPassword"]
     ):
-        base_streams.append(
+        error_streams.append(
             {
                 "name": _stream_notice_name(kodi, "[⚠️] Comet", "[WARN] Comet"),
                 "description": "Debrid Stream Proxy Password incorrect.\nStreams will not be proxied.",
@@ -770,23 +617,22 @@ async def stream(
     config_segment = f"/{compact_config}" if compact_config else ""
     playback_base_url = f"{base_playback_host}{api_prefix}{config_segment}"
     if b64config and is_v2:
-        base_streams[:0] = _render_discovery_diagnostics(
+        error_streams[:0] = _render_discovery_diagnostics(
             search_result.discovery_diagnostics,
             configure_url=f"{playback_base_url}/configure",
             kodi=kodi,
         )
     quoted_title = quote(title)
-    torrent_extension = get_debrid_extension("torrent")
-    torrent_service = "" if kodi else torrent_extension
-
-    if search_result.show_account_sync_trigger:
+    action_streams = []
+    auxiliary_policy = config["_resultsModel"].auxiliary
+    if search_result.show_account_sync_trigger and auxiliary_policy.debridSync != "off":
         for entry_index, _, _, debrid_extension in debrid_stream_specs:
-            base_streams.append(
+            action_streams.append(
                 {
                     "name": (
-                        f"[{debrid_extension}] Comet Sync"
+                        f"[ACTION] Comet — Sync {debrid_extension}"
                         if kodi
-                        else f"[{debrid_extension}🔄] Comet Sync"
+                        else f"[🔄] Comet action — Sync {debrid_extension}"
                     ),
                     "description": (
                         "Sync debrid account library now.\n"
@@ -795,83 +641,29 @@ async def stream(
                     "url": f"{playback_base_url}/debrid-sync/{entry_index}",
                 }
             )
-
-    ranked_info_hashes = search_result.ranked_info_hashes
-    direct_options = (
-        {
-            option.candidate_id: option
-            for option in search_result.provider_options
-            if option.provider.kind == "direct_torrent"
-        }
-        if is_v2 and enable_torrent
-        else {}
-    )
-    if not is_v2:
-        selected_info_hashes = _select_info_hashes_by_resolution(
-            ranked_info_hashes=search_result.ranked_info_hashes,
-            torrents=torrents,
-            service_cache_status=service_cache_status,
-            max_results=config["maxResultsPerResolution"],
-            cached_only=bool(
-                config["cachedOnly"] and debrid_entries and not enable_torrent
-            ),
-            prioritize_cached=False,
-        )
-        ranked_info_hashes = (
-            selected_info_hashes
-            if selected_info_hashes is not None
-            else search_result.ranked_info_hashes
-        )
-
-    for info_hash in ranked_info_hashes:
+    result_entries = search_result.pipeline.entries
+    debrid_specs_by_id = {item[1]: item for item in debrid_stream_specs}
+    for result_entry in result_entries:
+        if not result_entry.facts.candidate_id.startswith("btih:"):
+            continue
+        info_hash = result_entry.facts.candidate_id.removeprefix("btih:")
         torrent = torrents[info_hash]
         rtn_data = torrent["parsed"]
         torrent_title = torrent["title"]
-        torrent_size = torrent["size"]
-        formatted_components, formatted_title = _format_release(
-            rtn_data,
-            torrent_title,
-            seeders=torrent["seeders"],
-            size=torrent_size,
-            source=torrent["tracker"],
-            result_format=config["resultFormat"],
-            kodi=kodi,
-            media_info=torrent.get("mediaInfo"),
+        torrent_size = result_entry.playback_size
+        rendered, formatted_components = _entry_presentation(
+            result_entry, config, kodi=kodi
         )
-        info_hash_cache_status = service_cache_status.get(info_hash)
         quoted_torrent_title = quote(torrent_title)
-
-        for (
-            entry_index,
-            provider_configuration_id,
-            service,
-            debrid_extension,
-        ) in debrid_stream_specs:
-            if provider_configuration_id in debrid_errors:
+        if result_entry.provider_kind != "direct_torrent":
+            spec = debrid_specs_by_id.get(result_entry.provider_id)
+            if spec is None:
                 continue
-
-            is_cached = (
-                info_hash_cache_status.get(provider_configuration_id, False)
-                if info_hash_cache_status
-                else False
-            )
-
-            if not is_v2 and config["cachedOnly"] and not is_cached:
-                continue
-
-            stream_name = _build_stream_name(
-                kodi,
-                debrid_extension,
-                rtn_data.resolution,
-                icon="⚡" if is_cached else "⬇️",
-                formatted_components=formatted_components,
-                seeders=torrent["seeders"],
-                status="Cached" if is_cached else "On demand",
-            )
-
+            entry_index, provider_configuration_id, service, _extension = spec
+            is_cached = result_entry.cache_state.value == "cached"
             the_stream = {
-                "name": stream_name,
-                "description": formatted_title,
+                "name": rendered.name,
+                "description": rendered.description,
                 "behaviorHints": _release_behavior_hints(
                     binge_group=f"comet|{service}|{info_hash}",
                     filename=rtn_data.raw_title,
@@ -908,26 +700,11 @@ async def stream(
                     f"&media_id={quoted_media_only_id}&media_type={media_type}"
                 )
 
-            if is_v2:
-                provider_streams[presentation_key] = the_stream
-            else:
-                base_streams.append(the_stream)
-
-        if enable_torrent:
-            direct_option = direct_options[f"btih:{info_hash}"] if is_v2 else None
-            stream_name = _build_stream_name(
-                kodi,
-                torrent_service,
-                rtn_data.resolution,
-                icon="🧲",
-                formatted_components=formatted_components,
-                seeders=torrent["seeders"],
-                status="P2P",
-            )
-
+            provider_streams[result_entry.stable_id] = the_stream
+        else:
             the_stream = {
-                "name": stream_name,
-                "description": formatted_title,
+                "name": rendered.name,
+                "description": rendered.description,
                 "behaviorHints": _release_behavior_hints(
                     binge_group=f"comet|torrent|{info_hash}",
                     filename=rtn_data.raw_title,
@@ -950,15 +727,7 @@ async def stream(
             if sources:
                 the_stream["sources"] = sources
 
-            if direct_option is not None:
-                provider_streams[
-                    (
-                        direct_option.candidate_id,
-                        direct_option.provider.configuration_id,
-                    )
-                ] = the_stream
-            else:
-                base_streams.append(the_stream)
+            provider_streams[result_entry.stable_id] = the_stream
 
     if b64config and is_v2:
         server_usenet_streams = _render_server_usenet_options(
@@ -980,27 +749,34 @@ async def stream(
             response_cache_policy = CachePolicies.no_cache()
             provider_streams.update(nntp_handoffs)
 
-    if is_v2:
-        ordered_provider_streams = [
-            stream
-            for option in search_result.provider_options
-            if (
-                stream := provider_streams.get(
-                    (
-                        option.candidate_id,
-                        option.provider.configuration_id,
-                    )
-                )
-            )
-            is not None
-        ]
-        final_streams = base_streams + ordered_provider_streams
-    else:
-        final_streams = base_streams
-
-    has_results = bool(final_streams)
+    playable_streams = [
+        stream
+        for entry in result_entries
+        if (stream := provider_streams.get(entry.stable_id)) is not None
+    ]
+    summary = (
+        render_filter_summary(
+            search_result.pipeline,
+            config["_releasePolicy"],
+            kodi=kodi,
+            shown_entries=(
+                entry for entry in result_entries if entry.stable_id in provider_streams
+            ),
+        )
+        if auxiliary_policy.filterSummary != "off"
+        else None
+    )
+    final_streams = compose_auxiliary(
+        playable_streams,
+        errors=error_streams,
+        summary=summary,
+        actions=action_streams,
+        policy=auxiliary_policy,
+    )
+    has_results = bool(playable_streams)
 
     return _stream_response(
         {"streams": final_streams},
         is_empty=not has_results,
+        playable_count=len(playable_streams),
     )

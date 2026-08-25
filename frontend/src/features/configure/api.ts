@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { apiRequest, rawJsonRequest } from "../../api/client";
-import type { ConfigModel, ConfiguratorBootstrapData } from "../../api/generated/contracts";
+import type {
+  ConfigModel,
+  ConfiguratorBootstrapData,
+  DisplayConfig,
+  ResultsPreviewData,
+} from "../../api/generated/contracts";
 
 export function getConfiguratorBootstrap(): Promise<ConfiguratorBootstrapData> {
   return apiRequest("/api/v1/configure/bootstrap", { scope: "configure" });
@@ -9,6 +14,14 @@ export function getConfiguratorBootstrap(): Promise<ConfiguratorBootstrapData> {
 export function validateConfiguration(configuration: ConfigModel): Promise<ConfigModel> {
   return apiRequest("/api/v1/configure/validate", {
     body: JSON.stringify({ configuration }),
+    method: "POST",
+    scope: "configure",
+  });
+}
+
+export function previewResults(display: DisplayConfig): Promise<ResultsPreviewData> {
+  return apiRequest("/api/v1/configure/results/preview", {
+    body: JSON.stringify({ display }),
     method: "POST",
     scope: "configure",
   });

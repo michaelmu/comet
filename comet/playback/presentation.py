@@ -5,16 +5,14 @@ from dataclasses import dataclass
 
 from comet.core.capabilities import CapabilityPlan, EligibleProvider
 from comet.core.sources import (
+    SERVER_USENET_PROVIDER_KINDS,
     TORRENT_PROVIDER_KINDS,
     Locator,
     ReleaseCandidate,
 )
-from comet.playback.groups import (
-    build_presentation_groups,
-    limit_presentation_groups,
-)
 from comet.playback.repository import RenderedCandidateIds
 from comet.playback.tokens import (
+    MAX_FALLBACK_CHAIN_LENGTH,
     PLAYBACK_INTENT_TTL_SECONDS,
     CapabilityCodec,
 )
@@ -65,81 +63,6 @@ def build_provider_options(
     return tuple(options)
 
 
-def select_presentation(
-    candidates: tuple[ReleaseCandidate, ...],
-    options: tuple[ProviderOption, ...],
-    *,
-    cached_only: bool,
-    max_releases_per_resolution: int,
-    season_norm: int = -1,
-    episode_norm: int = -1,
-    daily_date: str | None = None,
-) -> tuple[tuple[ReleaseCandidate, ...], tuple[ProviderOption, ...]]:
-    """Build the sole deterministic provider-expanded presentation.
-
-    Release rank always dominates provider delivery details. Confirmed debrid
-    cache hits are preferred only among equivalent releases; no preparation
-    history participates in visibility or ordering.
-    """
-    candidate_order = {
-        candidate.candidate_id: index for index, candidate in enumerate(candidates)
-    }
-    eligible = [
-        option
-        for option in options
-        if option.candidate_id in candidate_order
-        and not (
-            cached_only
-            and option.provider.kind in TORRENT_PROVIDER_KINDS
-            and option.provider.kind != "direct_torrent"
-            and not option.cached
-        )
-    ]
-
-    candidate_options = {option.candidate_id for option in eligible}
-    eligible_candidates = tuple(
-        candidate
-        for candidate in candidates
-        if candidate.candidate_id in candidate_options
-    )
-    groups = build_presentation_groups(
-        eligible_candidates,
-        season_norm=season_norm,
-        episode_norm=episode_norm,
-        daily_date=daily_date,
-    )
-    retained_groups = limit_presentation_groups(groups, max_releases_per_resolution)
-    retained_candidate_ids = {
-        candidate.candidate_id
-        for group in retained_groups
-        for candidate in group.candidates
-    }
-    eligible = [
-        option for option in eligible if option.candidate_id in retained_candidate_ids
-    ]
-    group_order = {
-        candidate.candidate_id: group_index
-        for group_index, group in enumerate(retained_groups)
-        for candidate in group.candidates
-    }
-    eligible.sort(
-        key=lambda option: (
-            group_order[option.candidate_id],
-            0 if option.cached else 1,
-            option.provider.list_position,
-            candidate_order[option.candidate_id],
-            option.provider.configuration_id,
-        ),
-    )
-    visible_candidate_ids = {option.candidate_id for option in eligible}
-    visible_candidates = tuple(
-        candidate
-        for candidate in candidates
-        if candidate.candidate_id in visible_candidate_ids
-    )
-    return visible_candidates, tuple(eligible)
-
-
 def issue_provider_option_capability(
     codec: CapabilityCodec,
     *,
@@ -160,6 +83,56 @@ def issue_provider_option_capability(
         "pi2",
         partition=partition,
         suffix=[candidate_id, provider_id, locator_ids, selection_intent, client],
+        ttl=PLAYBACK_INTENT_TTL_SECONDS,
+    )
+
+
+def issue_fallback_option_capability(
+    codec: CapabilityCodec,
+    *,
+    partition: bytes,
+    options: tuple[ProviderOption, ...],
+    persisted: RenderedCandidateIds,
+    transport: str,
+    selection_intent: list,
+    client: str,
+) -> str:
+    """Sign two or three ordered server-side attempts for one rendered release."""
+    if not 2 <= len(options) <= MAX_FALLBACK_CHAIN_LENGTH:
+        raise ValueError("fallback chain must contain two or three providers")
+    candidate_ids = {option.candidate_id for option in options}
+    provider_ids = {option.provider.configuration_id for option in options}
+    if len(candidate_ids) != 1 or len(provider_ids) != len(options):
+        raise ValueError("fallback chain must use one candidate and unique providers")
+    if transport == "bittorrent":
+        allowed_kinds = TORRENT_PROVIDER_KINDS - {"direct_torrent"}
+    elif transport == "usenet":
+        allowed_kinds = SERVER_USENET_PROVIDER_KINDS
+    else:
+        raise ValueError("fallback transport is invalid")
+    if any(option.provider.kind not in allowed_kinds for option in options):
+        raise ValueError("fallback provider is incompatible with transport")
+    suffix_options = []
+    for option in options:
+        locator_ids = [
+            uuid.UUID(persisted.locator_ids[locator.locator_id]).bytes
+            for locator in option.locators
+        ]
+        if not locator_ids:
+            raise ValueError("fallback provider has no committed locator")
+        suffix_options.append(
+            [uuid.UUID(option.provider.configuration_id).bytes, locator_ids]
+        )
+    return codec.encode(
+        "pf2",
+        partition=partition,
+        suffix=[
+            uuid.UUID(persisted.candidate_id).bytes,
+            transport,
+            suffix_options,
+            selection_intent,
+            client,
+        ],
         ttl=PLAYBACK_INTENT_TTL_SECONDS,
     )
 

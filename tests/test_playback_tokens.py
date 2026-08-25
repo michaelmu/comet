@@ -12,6 +12,8 @@ from comet.playback.tokens import (
     PLAYBACK_INTENT_TTL_SECONDS,
     CapabilityCodec,
     CapabilityError,
+    FallbackPlaybackIntent,
+    FallbackProviderIntent,
 )
 
 ROOT = base64.urlsafe_b64encode(b"a" * 32).decode().rstrip("=")
@@ -235,6 +237,147 @@ def test_playback_intent_decoding_exposes_typed_identifiers():
         codec.decode_playback_intent(
             token.replace("pi2.", "na1."), partition=partition, now=120
         )
+
+
+def test_bounded_fallback_intent_round_trip_and_continuation_keep_deadline():
+    codec = CapabilityCodec(ROOT)
+    partition = codec.configuration_partition(b"normalized")
+    candidate = uuid.uuid4()
+    providers = tuple(uuid.uuid4() for _ in range(3))
+    locators = tuple(uuid.uuid4() for _ in range(3))
+    token = codec.encode(
+        "pf2",
+        partition=partition,
+        suffix=[
+            candidate.bytes,
+            "usenet",
+            [
+                [provider.bytes, [locator.bytes]]
+                for provider, locator in zip(providers, locators)
+            ],
+            [0],
+            "stremio",
+        ],
+        ttl=60,
+        now=100,
+    )
+
+    intent = codec.decode_fallback_playback_intent(token, partition=partition, now=120)
+    continuation = codec.encode_fallback_continuation(
+        FallbackPlaybackIntent(
+            intent.candidate_id,
+            intent.transport,
+            intent.options[1:],
+            intent.selection_intent,
+            intent.client,
+            intent.expires_at,
+        ),
+        partition=partition,
+        now=130,
+    )
+    remaining = codec.decode_fallback_playback_intent(
+        continuation, partition=partition, now=140
+    )
+
+    assert intent.current_intent.provider_configuration_id == str(providers[0])
+    assert tuple(
+        option.provider_configuration_id for option in remaining.options
+    ) == tuple(str(provider) for provider in providers[1:])
+    assert remaining.expires_at == 160
+
+
+def test_fallback_intent_rejects_more_than_three_or_duplicate_providers():
+    codec = CapabilityCodec(ROOT)
+    partition = codec.configuration_partition(b"normalized")
+    provider = uuid.uuid4()
+    locator = uuid.uuid4()
+    with pytest.raises(ValueError):
+        codec.encode(
+            "pf2",
+            partition=partition,
+            suffix=[
+                uuid.uuid4().bytes,
+                "bittorrent",
+                [[uuid.uuid4().bytes, [uuid.uuid4().bytes]] for _ in range(4)],
+                [0],
+                "stremio",
+            ],
+            ttl=60,
+        )
+    with pytest.raises(ValueError):
+        codec.encode(
+            "pf2",
+            partition=partition,
+            suffix=[
+                uuid.uuid4().bytes,
+                "usenet",
+                [
+                    [provider.bytes, [locator.bytes]],
+                    [provider.bytes, [uuid.uuid4().bytes]],
+                ],
+                [0],
+                "stremio",
+            ],
+            ttl=60,
+        )
+
+
+def test_fallback_intent_rejects_forged_candidate_transport_and_partition():
+    codec = CapabilityCodec(ROOT)
+    partition = codec.configuration_partition(b"normalized")
+    token = codec.encode(
+        "pf2",
+        partition=partition,
+        suffix=[
+            uuid.uuid4().bytes,
+            "usenet",
+            [[uuid.uuid4().bytes, [uuid.uuid4().bytes]]],
+            [0],
+            "stremio",
+        ],
+        ttl=60,
+        now=100,
+    )
+    prefix, encoded, signature = token.split(".")
+    payload = msgpack.unpackb(
+        base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)), raw=False
+    )
+    for index, forged in ((5, uuid.uuid4().bytes), (6, "bittorrent")):
+        changed = list(payload)
+        changed[index] = forged
+        changed_encoded = (
+            base64.urlsafe_b64encode(msgpack.packb(changed, use_bin_type=True))
+            .decode()
+            .rstrip("=")
+        )
+        with pytest.raises(CapabilityError):
+            codec.decode_fallback_playback_intent(
+                f"{prefix}.{changed_encoded}.{signature}",
+                partition=partition,
+                now=120,
+            )
+    with pytest.raises(CapabilityError):
+        codec.decode_fallback_playback_intent(
+            token,
+            partition=codec.configuration_partition(b"other-release-view"),
+            now=120,
+        )
+
+
+def test_expired_fallback_cannot_be_continued_or_revived():
+    codec = CapabilityCodec(ROOT)
+    partition = codec.configuration_partition(b"normalized")
+    intent = FallbackPlaybackIntent(
+        str(uuid.uuid4()),
+        "usenet",
+        (FallbackProviderIntent(str(uuid.uuid4()), (str(uuid.uuid4()),)),),
+        (0,),
+        "stremio",
+        160,
+    )
+
+    with pytest.raises(ValueError):
+        codec.encode_fallback_continuation(intent, partition=partition, now=160)
 
 
 def test_nzb_handoff_decoder_accepts_only_its_exact_audience():

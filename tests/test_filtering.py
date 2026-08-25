@@ -17,8 +17,52 @@ from comet.services.filtering import (
     exact_alias_match,
     filter_release_candidates,
     filter_release_records,
+    normalize_release_candidates_with_stats,
     settings,
 )
+
+
+class NormalizationSummaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_found_and_guard_counts_are_optional_aggregates(self):
+        base = ReleaseCandidate(
+            candidate_id="candidate",
+            media_id="tt123",
+            scope=ReleaseScope.MOVIE,
+            transport=TransportKind.BITTORRENT,
+            title="Other.Movie.2026.1080p.WEB-DL",
+            locators=(
+                TorrentLocator(
+                    locator_id="torrent",
+                    kind=LocatorKind.TORRENT,
+                    policy=LocatorPolicy(frozenset({"direct_torrent"})),
+                    info_hash="a" * 40,
+                ),
+            ),
+        )
+        enabled = await normalize_release_candidates_with_stats(
+            (base,),
+            title="Wanted Movie",
+            year=2026,
+            year_end=None,
+            media_type="movie",
+            aliases={},
+            collect_rejections=True,
+        )
+        self.assertEqual(enabled.found_count, 1)
+        self.assertEqual(enabled.candidates, ())
+        self.assertEqual(enabled.rejection_counts, (("title", 1),))
+
+        disabled = await normalize_release_candidates_with_stats(
+            (base,),
+            title="Wanted Movie",
+            year=2026,
+            year_end=None,
+            media_type="movie",
+            aliases={},
+            collect_rejections=False,
+        )
+        self.assertEqual(disabled.found_count, 1)
+        self.assertEqual(disabled.rejection_counts, ())
 
 
 class AliasFilteringTests(unittest.TestCase):

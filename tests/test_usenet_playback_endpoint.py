@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import time
 import unittest
 import uuid
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock, call, patch
 
@@ -14,6 +16,7 @@ from comet.api.endpoints.usenet_playback import (
     _advance_remote_preparation,
     _broker_nzb_transform,
     _close_artifact_reader_leases,
+    _fallback_redirect_response,
     _log_playback_failure,
     _native_range,
     _native_session_body,
@@ -21,6 +24,7 @@ from comet.api.endpoints.usenet_playback import (
     _poll_stremthru_interactively,
     _poll_torbox_interactively,
     _preparation_state_response,
+    _provider_failure_allows_fallback,
     _resolved_remote_download_url,
     _run_remote_preparation,
     _serve_torrent_debrid,
@@ -29,12 +33,18 @@ from comet.api.endpoints.usenet_playback import (
 )
 from comet.discovery.adapters.newznab import NewznabError
 from comet.metadata.manager import MetadataFetchResult, MetadataFetchStatus
+from comet.playback.base import ProviderRuntimeError
 from comet.playback.manager import NzbSourceError
 from comet.playback.providers.altmount import AltMountError
 from comet.playback.providers.nzbdav import NzbDavError
 from comet.playback.providers.stremthru_newz import StremThruNewzError
 from comet.playback.providers.torbox_usenet import TorBoxUsenetError
 from comet.playback.providers.torrent_debrid import TorrentDebridProvider
+from comet.playback.tokens import (
+    CapabilityCodec,
+    FallbackPlaybackIntent,
+    FallbackProviderIntent,
+)
 from comet.usenet.easynews import EasynewsNzbError
 from comet.usenet.engine_client import EngineNntpError
 from comet.usenet.engine_transport import EngineUnavailable
@@ -134,6 +144,148 @@ def _range_request(value: str | None) -> Request:
 
 
 class UsenetPlaybackEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pf2_retries_next_provider_after_explicit_technical_failure(self):
+        config = {"schemaVersion": 2}
+        codec = CapabilityCodec(ROOT)
+        partition = codec.configuration_partition_for_config(config)
+        providers = tuple(str(uuid.uuid4()) for _ in range(2))
+        fallback = FallbackPlaybackIntent(
+            str(uuid.uuid4()),
+            "bittorrent",
+            tuple(
+                FallbackProviderIntent(provider, (str(uuid.uuid4()),))
+                for provider in providers
+            ),
+            (0,),
+            "stremio",
+            int(time.time()) + 60,
+        )
+        prepared = SimpleNamespace(
+            capability="pa2.payload.signature",
+            preparation=SimpleNamespace(
+                provider_kind="torbox",
+                provider_configuration_id=providers[0],
+                state="pending",
+            ),
+            resolution=SimpleNamespace(release=TEST_RELEASE),
+        )
+        with (
+            patch(
+                "comet.api.endpoints.usenet_playback.config_check",
+                return_value=config,
+            ),
+            patch(
+                "comet.api.endpoints.usenet_playback.settings.COMET_CAPABILITY_SECRET",
+                ROOT,
+            ),
+            patch(
+                "comet.api.endpoints.usenet_playback.http_client_manager.get_session",
+                AsyncMock(return_value=object()),
+            ),
+            patch(
+                "comet.api.endpoints.usenet_playback.create_fallback_playback_preparation",
+                AsyncMock(return_value=(prepared, fallback)),
+            ),
+            patch(
+                "comet.api.endpoints.usenet_playback._serve_torrent_debrid",
+                AsyncMock(
+                    side_effect=ProviderRuntimeError("unavailable", retryable=True)
+                ),
+            ) as serve,
+            patch("comet.api.endpoints.usenet_playback._log_playback_failure"),
+            patch(
+                "comet.api.endpoints.usenet_playback.record_playback_capability_failure",
+                AsyncMock(),
+            ),
+        ):
+            response = await playback_v2(_request(), "config", "pf2.payload.signature")
+            serve.side_effect = ProviderRuntimeError("unknown")
+            nontechnical = await playback_v2(
+                _request(), "config", "pf2.payload.signature"
+            )
+
+        token = response.headers["location"].rsplit("/", 1)[-1]
+        remaining = codec.decode_fallback_playback_intent(token, partition=partition)
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(
+            remaining.current_intent.provider_configuration_id, providers[1]
+        )
+        self.assertNotIn(providers[0], response.headers["location"])
+        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+        self.assertNotEqual(nontechnical.status_code, 307)
+        self.assertNotIn("location", nontechnical.headers)
+
+    async def test_fallback_redirect_advances_once_and_preserves_deadline(self):
+        config = {"schemaVersion": 2}
+        codec = CapabilityCodec(ROOT)
+        partition = codec.configuration_partition_for_config(config)
+        expires_at = int(time.time()) + 60
+        providers = tuple(str(uuid.uuid4()) for _ in range(2))
+        fallback = FallbackPlaybackIntent(
+            str(uuid.uuid4()),
+            "usenet",
+            tuple(
+                FallbackProviderIntent(provider, (str(uuid.uuid4()),))
+                for provider in providers
+            ),
+            (0,),
+            "stremio",
+            expires_at,
+        )
+
+        response = _fallback_redirect_response(
+            fallback,
+            codec=codec,
+            partition=partition,
+            b64config="config",
+            config=config,
+        )
+        token = response.headers["location"].rsplit("/", 1)[-1]
+        remaining = codec.decode_fallback_playback_intent(token, partition=partition)
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(len(remaining.options), 1)
+        self.assertEqual(remaining.options[0].provider_configuration_id, providers[1])
+        self.assertEqual(remaining.expires_at, expires_at)
+        self.assertIsNone(
+            _fallback_redirect_response(
+                remaining,
+                codec=codec,
+                partition=partition,
+                b64config="config",
+                config=config,
+            )
+        )
+        self.assertIsNone(
+            _fallback_redirect_response(
+                replace(fallback, expires_at=int(time.time()) - 1),
+                codec=codec,
+                partition=partition,
+                b64config="config",
+                config=config,
+            )
+        )
+
+    async def test_only_explicit_technical_provider_errors_allow_fallback(self):
+        self.assertTrue(
+            _provider_failure_allows_fallback(
+                ProviderRuntimeError("unavailable", retryable=True)
+            )
+        )
+        self.assertFalse(
+            _provider_failure_allows_fallback(ProviderRuntimeError("unknown"))
+        )
+        self.assertFalse(
+            _provider_failure_allows_fallback(
+                ProviderRuntimeError("auth", retryable=True, auth_failed=True)
+            )
+        )
+        self.assertFalse(
+            _provider_failure_allows_fallback(
+                ProviderRuntimeError("mutation", retryable=True, mutation_rejected=True)
+            )
+        )
+
     def setUp(self):
         monitor = patch("comet.api.endpoints.usenet_playback.usenet_operation_monitor")
         self.operation_monitor = monitor.start()
@@ -460,6 +612,18 @@ class UsenetPlaybackEndpointTests(unittest.IsolatedAsyncioTestCase):
                 client_ip="127.0.0.1",
                 add_background_task=add_background_task,
             )
+            provider.generate_download_link.return_value = "javascript:invalid"
+            with self.assertRaisesRegex(
+                ProviderRuntimeError, "provider_redirect_invalid"
+            ):
+                await _serve_torrent_debrid(
+                    _request(),
+                    prepared,
+                    {"debridStreamProxyPassword": ""},
+                    object(),
+                    owner_configuration_partition=b"a" * 32,
+                    client_ip="127.0.0.1",
+                )
 
         self.assertEqual(response.status_code, 307)
         self.assertEqual(
@@ -467,7 +631,7 @@ class UsenetPlaybackEndpointTests(unittest.IsolatedAsyncioTestCase):
             "https://download.example/video?signature=temporary",
         )
         self.assertEqual(response.headers["Cache-Control"], "private, no-store")
-        provider.generate_download_link.assert_awaited_once()
+        self.assertEqual(provider.generate_download_link.await_count, 2)
         cache.assert_awaited_once()
         self.assertIs(
             cache.await_args.kwargs["add_background_task"],

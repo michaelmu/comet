@@ -179,6 +179,7 @@ class StremThru:
         ):
             raise DebridLinkGenerationError(
                 f"{self.store_name}: Failed to {action}.",
+                retryable=True,
             ) from None
         return status, data
 
@@ -204,10 +205,12 @@ class StremThru:
                 f"{self.store_name}: Failed to {action}.",
                 error_code=error.get("code"),
                 upstream_error_code=self._extract_upstream_error_code(upstream),
+                retryable=status == 429 or status >= 500,
             )
         if not 200 <= status < 300:
             raise DebridLinkGenerationError(
                 f"{self.store_name}: Failed to {action}.",
+                retryable=status == 429 or status >= 500,
             )
         return data
 

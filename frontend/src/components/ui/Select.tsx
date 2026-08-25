@@ -2,6 +2,7 @@ import * as SelectPrimitive from "@radix-ui/react-select";
 import { Check, ChevronDown } from "lucide-react";
 import {
   Children,
+  Fragment,
   isValidElement,
   type OptionHTMLAttributes,
   type ReactElement,
@@ -21,29 +22,48 @@ interface SelectProps {
   name?: string;
   onValueChange?: (value: string) => void;
   required?: boolean | undefined;
+  title?: string | undefined;
   value: string;
 }
 
 interface SelectOption {
   disabled: boolean;
+  group?: string;
   label: ReactNode;
   value: string;
 }
 
 const EMPTY_VALUE = "__comet_empty__";
 
-function getOptions(children: ReactNode): SelectOption[] {
+function getOptions(children: ReactNode, group?: string): SelectOption[] {
   return Children.toArray(children).flatMap((child) => {
-    if (!isValidElement(child) || child.type !== "option") return [];
+    if (!isValidElement(child)) return [];
+    if (child.type === "optgroup") {
+      const optgroup = child as ReactElement<{ children?: ReactNode; label: string }>;
+      return getOptions(optgroup.props.children, optgroup.props.label);
+    }
+    if (child.type !== "option") return [];
     const option = child as ReactElement<OptionHTMLAttributes<HTMLOptionElement>>;
     return [
       {
         disabled: option.props.disabled === true,
+        ...(group ? { group } : {}),
         label: option.props.children,
         value: String(option.props.value ?? option.props.children ?? ""),
       },
     ];
   });
+}
+
+/** Collapse consecutive options sharing a group so Radix gets one Group each. */
+function groupOptions(options: SelectOption[]): [string | undefined, SelectOption[]][] {
+  const groups: [string | undefined, SelectOption[]][] = [];
+  for (const option of options) {
+    const current = groups.at(-1);
+    if (current && current[0] === option.group) current[1].push(option);
+    else groups.push([option.group, [option]]);
+  }
+  return groups;
 }
 
 export function Select({
@@ -57,6 +77,7 @@ export function Select({
   name,
   onValueChange,
   required = false,
+  title,
   value,
 }: SelectProps) {
   const id = useId();
@@ -89,6 +110,7 @@ export function Select({
             openedWithPointer.current = true;
           }}
           ref={trigger}
+          title={title}
         >
           {leadingIcon ? (
             <span aria-hidden="true" className="select-trigger__leading-icon">
@@ -118,19 +140,31 @@ export function Select({
             sideOffset={6}
           >
             <SelectPrimitive.Viewport className="select-viewport">
-              {options.map((option) => (
-                <SelectPrimitive.Item
-                  className="select-item"
-                  disabled={option.disabled}
-                  key={option.value || EMPTY_VALUE}
-                  value={option.value || EMPTY_VALUE}
-                >
-                  <SelectPrimitive.ItemText>{option.label}</SelectPrimitive.ItemText>
-                  <SelectPrimitive.ItemIndicator className="select-item__indicator">
-                    <Check aria-hidden="true" size={15} strokeWidth={1.6} />
-                  </SelectPrimitive.ItemIndicator>
-                </SelectPrimitive.Item>
-              ))}
+              {groupOptions(options).map(([group, entries]) => {
+                const items = entries.map((option) => (
+                  <SelectPrimitive.Item
+                    className="select-item"
+                    disabled={option.disabled}
+                    key={option.value || EMPTY_VALUE}
+                    value={option.value || EMPTY_VALUE}
+                  >
+                    <SelectPrimitive.ItemText>{option.label}</SelectPrimitive.ItemText>
+                    <SelectPrimitive.ItemIndicator className="select-item__indicator">
+                      <Check aria-hidden="true" size={15} strokeWidth={1.6} />
+                    </SelectPrimitive.ItemIndicator>
+                  </SelectPrimitive.Item>
+                ));
+                return group === undefined ? (
+                  <Fragment key="ungrouped">{items}</Fragment>
+                ) : (
+                  <SelectPrimitive.Group key={group}>
+                    <SelectPrimitive.Label className="select-group-label">
+                      {group}
+                    </SelectPrimitive.Label>
+                    {items}
+                  </SelectPrimitive.Group>
+                );
+              })}
             </SelectPrimitive.Viewport>
           </SelectPrimitive.Content>
         </SelectPrimitive.Portal>

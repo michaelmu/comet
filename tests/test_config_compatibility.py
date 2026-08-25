@@ -66,7 +66,7 @@ class ConfigCompatibilityTests(unittest.TestCase):
         config = config_check(_encode(DEVELOPMENT_CONFIGURATOR_DOCUMENT, urlsafe=False))
 
         self.assertIsNotNone(config)
-        self.assertNotIn("remove_ranks_under", config["options"])
+        self.assertNotIn("options", config)
         self.assertEqual(
             config["rtnSettings"].options.remove_ranks_under,
             -10_000_000_000,
@@ -259,7 +259,9 @@ class ConfigCompatibilityTests(unittest.TestCase):
             base64.urlsafe_b64encode(b'{"maxSize":1,"maxSize":2}').decode().rstrip("=")
         )
         self.assertEqual(
-            config_check(duplicate)["maxSize"],
+            config_check(duplicate)["results"]["filters"]["ranges"]["playbackSize"][
+                "max"
+            ],
             2.0,
         )
 
@@ -296,7 +298,7 @@ class InstalledAddonCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         encoded = encode_configuration_segment(
             orjson.dumps(DEVELOPMENT_CONFIGURATOR_DOCUMENT)
         )
-        self.assertTrue(encoded.startswith("z1."))
+        self.assertTrue(encoded.startswith(("z1.", "z2.")))
         with patch(
             "comet.api.endpoints.manifest.eligible_usenet_provider_badges",
             new=AsyncMock(return_value=[]),

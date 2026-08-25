@@ -16,6 +16,10 @@ from comet.core.models import (
     settings,
 )
 from comet.core.sources import TORRENT_PROVIDER_KINDS
+from comet.results.config import LanguagesConfig, ResultsConfig
+from comet.results.formatting import compile_display
+from comet.results.migrations import migrate_configuration_document
+from comet.results.policy import ReleasePolicy
 
 
 def _normalize_debrid_config(validated_config: dict) -> dict:
@@ -86,12 +90,6 @@ def _normalize_v2_torrent_providers(
     return normalized, direct_enabled
 
 
-_DEFAULT_VALIDATED_CONFIG = default_config.copy()
-_DEFAULT_VALIDATED_CONFIG["_debridEntries"] = []
-_DEFAULT_VALIDATED_CONFIG["_enableTorrent"] = True
-_DEFAULT_OPTIONS = default_config["options"]
-
-
 def _reject_nonfinite_json_constant(_value):
     raise ValueError("non-finite JSON number")
 
@@ -104,23 +102,29 @@ class _ValidatedConfiguration(dict):
 
 def normalize_validated_config(validated_config: dict) -> dict:
     """Build the runtime representation shared by every configuration entrypoint."""
-    options = _DEFAULT_OPTIONS | (validated_config["options"] or {})
-    validated_config["options"] = {
-        "allow_english_in_languages": options["allow_english_in_languages"],
-        "remove_unknown_languages": options["remove_unknown_languages"],
-        "remove_all_trash": validated_config["removeTrash"],
+    results = validated_config["results"]
+    languages = validated_config["languages"]
+    results_model = ResultsConfig.model_validate(results)
+    languages_model = LanguagesConfig.model_validate(languages)
+    validated_config["_resultsModel"] = results_model
+    validated_config["_languagesModel"] = languages_model
+    validated_config["_releasePolicy"] = ReleasePolicy.compile(
+        results_model, languages_model
+    )
+    validated_config["_displayRenderer"] = compile_display(results_model.display)
+    options = {
+        "allow_english_in_languages": False,
+        "remove_unknown_languages": languages["unknown"] == "exclude",
+        # Eligibility belongs to ReleasePolicy. RTN remains the scorer/parser.
+        "remove_all_trash": False,
     }
 
     validated_config["rtnSettings"] = rtn_settings_default.model_copy(
         update={
-            "resolutions": rtn_settings_default.resolutions.model_copy(
-                update=validated_config["resolutions"]
-            ),
-            "options": rtn_settings_default.options.model_copy(
-                update=validated_config["options"]
-            ),
+            "resolutions": rtn_settings_default.resolutions,
+            "options": rtn_settings_default.options.model_copy(update=options),
             "languages": rtn_settings_default.languages.model_copy(
-                update=validated_config["languages"]
+                update={"preferred": languages["preferred"]}
             ),
         }
     )
@@ -145,7 +149,7 @@ def normalize_validated_config(validated_config: dict) -> dict:
         validated_config["enabledTransports"] = tuple(
             transport
             for transport in ("bittorrent", "usenet")
-            if transport in validated_config["enabledTransports"]
+            if transport in (validated_config["enabledTransports"] or ())
         )
     return validated_config
 
@@ -154,9 +158,12 @@ def normalize_validated_config(validated_config: dict) -> dict:
 def _parse_and_validate_config(b64config: str):
     try:
         decoded = decode_configuration_segment(b64config)
-        config = json.loads(
-            decoded.decode("utf-8"),
-            parse_constant=_reject_nonfinite_json_constant,
+        config = migrate_configuration_document(
+            json.loads(
+                decoded.decode("utf-8"),
+                parse_constant=_reject_nonfinite_json_constant,
+            ),
+            legacy_if_results_missing=True,
         )
     except ValueError:
         return None
@@ -171,6 +178,9 @@ def _parse_and_validate_config(b64config: str):
         )
     except ValueError:
         return None
+
+
+_DEFAULT_VALIDATED_CONFIG = normalize_validated_config(default_config.copy())
 
 
 def config_check(b64config: str | None):

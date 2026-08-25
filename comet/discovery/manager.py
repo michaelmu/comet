@@ -15,6 +15,7 @@ from comet.discovery.base import DiscoveryAdapter
 from comet.discovery.capabilities import DiscoveryBranchFingerprint
 from comet.discovery.coverage import SearchCoverageRepository, query_fingerprint
 from comet.discovery.models import (
+    CandidateNormalizationResult,
     DiscoveryBatch,
     DiscoveryContext,
     MediaQuery,
@@ -32,6 +33,12 @@ class DiscoveryResult:
     diagnostics: tuple[str, ...]
     capability_plan: CapabilityPlan
     inflight: bool = False
+    found_count: int = 0
+    rejection_counts: tuple[tuple[str, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.found_count == 0 and self.candidates:
+            object.__setattr__(self, "found_count", len(self.candidates))
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +120,7 @@ class SearchCoordinator:
         candidate_normalizer: (
             Callable[
                 [tuple[ReleaseCandidate, ...]],
-                Awaitable[tuple[ReleaseCandidate, ...]],
+                Awaitable[tuple[ReleaseCandidate, ...] | CandidateNormalizationResult],
             ]
             | None
         ) = None,
@@ -263,11 +270,19 @@ class SearchCoordinator:
                     )
         if had_failures and not candidates:
             diagnostics.append("Discovery is temporarily unavailable")
+        raw_candidates = tuple(candidates)
+        normalized = CandidateNormalizationResult(raw_candidates, len(raw_candidates))
+        if self._candidate_normalizer is not None and raw_candidates:
+            normalized = await self._candidate_normalizer(raw_candidates)
+        if isinstance(normalized, tuple):
+            normalized = CandidateNormalizationResult(normalized, len(raw_candidates))
         return DiscoveryResult(
-            tuple(candidates),
+            normalized.candidates,
             tuple(diagnostics),
             capability_plan,
             inflight=had_inflight and not candidates,
+            found_count=normalized.found_count,
+            rejection_counts=normalized.rejection_counts,
         )
 
     async def _search_source(
@@ -300,7 +315,7 @@ class SearchCoordinator:
                 hard_deadline,
                 cancellation,
             )
-            return await self._normalize_batch(response)
+            return response
         branch_pairs = tuple(
             (
                 branch,
@@ -522,7 +537,6 @@ class SearchCoordinator:
                         hard_deadline,
                         cancellation,
                     )
-                    response = await self._normalize_batch(response)
                     log.info(
                         "discovery.refresh.completed",
                         "Discovery source scrape completed",
@@ -593,12 +607,6 @@ class SearchCoordinator:
             raise
         finally:
             await lock.release()
-
-    async def _normalize_batch(self, response: DiscoveryBatch) -> DiscoveryBatch:
-        if self._candidate_normalizer is None or not response.candidates:
-            return response
-        candidates = await self._candidate_normalizer(response.candidates)
-        return replace(response, candidates=candidates)
 
 
 def _context(

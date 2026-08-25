@@ -18,6 +18,7 @@ from comet.core.capability_bindings import (
 )
 from comet.core.models import settings
 from comet.core.provider_governor import ProviderGovernor
+from comet.core.sources import SERVER_USENET_PROVIDER_KINDS, TORRENT_PROVIDER_KINDS
 from comet.discovery.adapters.newznab import NewznabError
 from comet.observability import log
 from comet.playback.base import Readiness
@@ -40,7 +41,11 @@ from comet.playback.providers.torbox_usenet import (
 from comet.playback.registry import build_playback_providers
 from comet.playback.repository import RenderedReleaseRepository, ResolvedPlaybackIntent
 from comet.playback.resolution_cache import ProviderResolutionCacheRepository
-from comet.playback.tokens import CapabilityCodec, PlaybackIntent
+from comet.playback.tokens import (
+    CapabilityCodec,
+    FallbackPlaybackIntent,
+    PlaybackIntent,
+)
 from comet.services.lock import DistributedLock
 from comet.usenet.access import NativeAccessAuthorizer
 from comet.usenet.archive_passwords import (
@@ -263,6 +268,45 @@ async def resolve_playback_intent(
     )
 
 
+async def resolve_fallback_playback_intent(
+    token: str,
+    config: dict,
+    database,
+    session,
+    *,
+    client_ip: str = "",
+    expected_client: str | None = "stremio",
+) -> tuple[PlaybackIntentResolution, FallbackPlaybackIntent]:
+    """Revalidate and resolve only the current attempt in a signed chain."""
+    if not settings.COMET_CAPABILITY_SECRET:
+        raise ValueError("signed playback is unavailable")
+    codec = CapabilityCodec(settings.COMET_CAPABILITY_SECRET)
+    partition = codec.configuration_partition_for_config(config)
+    fallback = codec.decode_fallback_playback_intent(token, partition=partition)
+    allowed_kinds = (
+        TORRENT_PROVIDER_KINDS - {"direct_torrent"}
+        if fallback.transport == "bittorrent"
+        else SERVER_USENET_PROVIDER_KINDS
+    )
+    for option in fallback.options:
+        entry = _provider_entry(config, option.provider_configuration_id)
+        if entry.get("kind") not in allowed_kinds:
+            raise ValueError("fallback provider is unavailable")
+    resolution = await _resolve_decoded_intent(
+        fallback.current_intent,
+        config,
+        database,
+        session,
+        codec=codec,
+        partition=partition,
+        client_ip=client_ip,
+        expected_client=expected_client,
+    )
+    if resolution.release.transport != fallback.transport:
+        raise ValueError("fallback transport is unavailable")
+    return resolution, fallback
+
+
 async def resolve_nzb_handoff_intent(
     token: str,
     config: dict,
@@ -401,6 +445,36 @@ async def create_playback_preparation(
         client_ip=client_ip,
         expected_client=expected_client,
     )
+    return await _create_preparation_from_resolution(resolution, config, database)
+
+
+async def create_fallback_playback_preparation(
+    token: str,
+    config: dict,
+    database,
+    session,
+    *,
+    client_ip: str = "",
+    expected_client: str | None = "stremio",
+) -> tuple[PreparedPlaybackIntent, FallbackPlaybackIntent]:
+    """Persist only the first currently selected fallback attempt."""
+    resolution, fallback = await resolve_fallback_playback_intent(
+        token,
+        config,
+        database,
+        session,
+        client_ip=client_ip,
+        expected_client=expected_client,
+    )
+    prepared = await _create_preparation_from_resolution(resolution, config, database)
+    return prepared, fallback
+
+
+async def _create_preparation_from_resolution(
+    resolution: PlaybackIntentResolution,
+    config: dict,
+    database,
+) -> PreparedPlaybackIntent:
     codec = CapabilityCodec(settings.COMET_CAPABILITY_SECRET)
     partition = codec.configuration_partition_for_config(config)
     preparation = await PlaybackPreparationRepository(database).get_or_create(

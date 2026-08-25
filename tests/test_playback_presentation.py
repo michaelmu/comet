@@ -15,9 +15,9 @@ from comet.core.sources import (
 )
 from comet.playback.presentation import (
     build_provider_options,
+    issue_fallback_option_capability,
     issue_nzb_handoff_capability,
     issue_provider_option_capability,
-    select_presentation,
 )
 from comet.playback.repository import RenderedCandidateIds
 from comet.playback.tokens import (
@@ -97,75 +97,99 @@ class ProviderPresentationTests(unittest.TestCase):
             ],
         )
 
-    def test_presentation_keeps_every_compatible_never_prepared_path(self):
-        first = self._mixed_candidate("first")
-        second = ReleaseCandidate(
-            candidate_id="unknown-only",
-            media_id="tt123",
-            scope=ReleaseScope.MOVIE,
-            transport=TransportKind.USENET,
-            title="Unknown.2024.1080p",
-            locators=(first.locators[0],),
-        )
-        candidates, options = select_presentation(
-            (first, second),
-            build_provider_options((first, second), self._mixed_plan()),
-            cached_only=False,
-            max_releases_per_resolution=0,
-        )
-
-        self.assertEqual(candidates, (first, second))
-        self.assertEqual(
-            [option.provider.kind for option in options],
-            ["torbox_usenet", "stremio_nntp", "torbox_usenet"],
-        )
-
-    def test_presentation_keeps_configured_provider_alternatives(self):
+    def test_provider_build_keeps_configured_provider_alternatives(self):
         candidate = self._mixed_candidate("candidate")
 
-        candidates, options = select_presentation(
-            (candidate,),
-            build_provider_options((candidate,), self._mixed_plan()),
-            cached_only=False,
-            max_releases_per_resolution=0,
-        )
+        options = build_provider_options((candidate,), self._mixed_plan())
 
-        self.assertEqual(candidates, (candidate,))
         self.assertEqual(len(options), 2)
         self.assertEqual(
             [option.provider.kind for option in options],
             ["torbox_usenet", "stremio_nntp"],
         )
 
-    def test_presentation_never_reorders_releases_from_playback_history(self):
-        mixed = self._mixed_candidate("source")
-        unknown = ReleaseCandidate(
-            candidate_id="higher-ranked-unknown",
+    def test_issues_bounded_fallback_from_committed_ids_only(self):
+        provider_ids = (
+            "11111111-1111-4111-8111-111111111111",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        config = {
+            "schemaVersion": 2,
+            "enabledTransports": ["usenet"],
+            "playbackProviders": [
+                {
+                    "configurationId": provider_ids[0],
+                    "displayName": "Cloud A",
+                    "kind": "torbox_usenet",
+                    "enabled": True,
+                },
+                {
+                    "configurationId": provider_ids[1],
+                    "displayName": "Cloud B",
+                    "kind": "nzbdav",
+                    "enabled": True,
+                },
+            ],
+        }
+        candidate = ReleaseCandidate(
+            candidate_id="candidate",
             media_id="tt123",
             scope=ReleaseScope.MOVIE,
             transport=TransportKind.USENET,
-            title="Unknown.2024.1080p",
-            locators=(mixed.locators[0],),
+            title="Example.2024.1080p",
+            locators=(
+                NzbArtifactRef(
+                    locator_id="artifact",
+                    kind=LocatorKind.NZB_ARTIFACT,
+                    policy=LocatorPolicy(frozenset({"torbox_usenet", "nzbdav"})),
+                    artifact_sha256="a" * 64,
+                    manifest_identity="nm1:" + "b" * 64,
+                ),
+            ),
         )
-        ready = ReleaseCandidate(
-            candidate_id="lower-ranked-ready",
-            media_id="tt123",
-            scope=ReleaseScope.MOVIE,
-            transport=TransportKind.USENET,
-            title="Ready.2024.1080p",
-            locators=(mixed.locators[1],),
+        plan = CapabilityPlanner(
+            usenet_offered=True,
+            native_authorizer=NativeAccessAuthorizer(None),
+        ).build(config)
+        options = build_provider_options((candidate,), plan)
+        persisted = RenderedCandidateIds(
+            str(uuid.uuid4()), {"artifact": str(uuid.uuid4())}
         )
-        _candidates, options = select_presentation(
-            (unknown, ready),
-            build_provider_options((unknown, ready), self._mixed_plan()),
-            cached_only=False,
-            max_releases_per_resolution=0,
+        codec = CapabilityCodec(
+            base64.urlsafe_b64encode(b"a" * 32).decode().rstrip("=")
         )
+        partition = codec.configuration_partition(b"config")
 
-        self.assertEqual(
-            [option.candidate_id for option in options],
-            [unknown.candidate_id, ready.candidate_id],
+        token = issue_fallback_option_capability(
+            codec,
+            partition=partition,
+            options=options,
+            persisted=persisted,
+            transport="usenet",
+            selection_intent=[0],
+            client="stremio",
         )
+        intent = codec.decode_fallback_playback_intent(token, partition=partition)
+
+        self.assertEqual(intent.candidate_id, persisted.candidate_id)
+        self.assertEqual(
+            tuple(option.provider_configuration_id for option in intent.options),
+            provider_ids,
+        )
+        self.assertEqual(
+            intent.options[0].locator_ids,
+            (persisted.locator_ids["artifact"],),
+        )
+        with self.assertRaises(ValueError):
+            issue_fallback_option_capability(
+                codec,
+                partition=partition,
+                options=(options[0], options[1], options[0], options[1]),
+                persisted=persisted,
+                transport="usenet",
+                selection_intent=[0],
+                client="stremio",
+            )
 
     def test_issues_lazy_handoff_for_an_exact_easynews_generated_nzb_target(self):
         provider_id = "11111111-1111-4111-8111-111111111111"

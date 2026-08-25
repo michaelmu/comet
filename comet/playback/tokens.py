@@ -14,16 +14,19 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from comet.core.capability_states import deterministic_cbor
 
 PLAYBACK_INTENT_TTL_SECONDS = 6 * 60 * 60
+MAX_FALLBACK_CHAIN_LENGTH = 3
 _SALT = b"comet-capability-root-v1"
 _DOMAIN = b"comet-cap-v1\0"
 _PREFIX_AUDIENCES = {
     "pi2": "playback-intent",
+    "pf2": "playback-fallback-intent",
     "pa2": "prepared-asset",
     "na1": "stremio-nzb",
     "ni2": "stremio-nzb-handoff",
 }
 _PREFIX_MAX_TTL = {
     "pi2": PLAYBACK_INTENT_TTL_SECONDS,
+    "pf2": PLAYBACK_INTENT_TTL_SECONDS,
     "pa2": 6 * 60 * 60,
     "na1": 6 * 60 * 60,
     "ni2": 6 * 60 * 60,
@@ -44,6 +47,35 @@ class PlaybackIntent:
     locator_ids: tuple[str, ...]
     selection_intent: tuple[object, ...]
     client: str
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackProviderIntent:
+    provider_configuration_id: str
+    locator_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackPlaybackIntent:
+    """A bounded, ordered set of provider attempts for one candidate/transport."""
+
+    candidate_id: str
+    transport: str
+    options: tuple[FallbackProviderIntent, ...]
+    selection_intent: tuple[object, ...]
+    client: str
+    expires_at: int
+
+    @property
+    def current_intent(self) -> PlaybackIntent:
+        current = self.options[0]
+        return PlaybackIntent(
+            self.candidate_id,
+            current.provider_configuration_id,
+            current.locator_ids,
+            self.selection_intent,
+            self.client,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +156,31 @@ def _valid_suffix(prefix: str, suffix: object) -> bool:
             and _is_selection_intent(suffix[3])
             and suffix[4] in _CLIENT_ENUM
         )
+    if prefix == "pf2":
+        if (
+            len(suffix) != 5
+            or not _is_uuid_bytes(suffix[0])
+            or suffix[1] not in {"bittorrent", "usenet"}
+            or not isinstance(suffix[2], list)
+            or not 1 <= len(suffix[2]) <= MAX_FALLBACK_CHAIN_LENGTH
+            or not _is_selection_intent(suffix[3])
+            or suffix[4] not in _CLIENT_ENUM
+        ):
+            return False
+        provider_ids = []
+        for option in suffix[2]:
+            if (
+                not isinstance(option, list)
+                or len(option) != 2
+                or not _is_uuid_bytes(option[0])
+                or not isinstance(option[1], list)
+                or not option[1]
+                or not all(_is_uuid_bytes(locator) for locator in option[1])
+                or len(set(option[1])) != len(option[1])
+            ):
+                return False
+            provider_ids.append(option[0])
+        return len(set(provider_ids)) == len(provider_ids)
     if prefix == "ni2":
         return (
             len(suffix) == 5
@@ -417,6 +474,61 @@ class CapabilityCodec:
         if not token.startswith("pi2."):
             raise CapabilityError("invalid playback intent")
         return self._decode_intent(token, partition=partition, now=now)
+
+    def decode_fallback_playback_intent(
+        self, token: str, *, partition: bytes, now: int | None = None
+    ) -> FallbackPlaybackIntent:
+        """Decode only the bounded sequential fallback audience."""
+        if not token.startswith("pf2."):
+            raise CapabilityError("invalid fallback playback intent")
+        value = self.decode(token, partition=partition, now=now)
+        candidate_id, transport, options, selection_intent, client = value[5:]
+        return FallbackPlaybackIntent(
+            candidate_id=str(uuid.UUID(bytes=candidate_id)),
+            transport=transport,
+            options=tuple(
+                FallbackProviderIntent(
+                    str(uuid.UUID(bytes=provider_id)),
+                    tuple(str(uuid.UUID(bytes=item)) for item in locator_ids),
+                )
+                for provider_id, locator_ids in options
+            ),
+            selection_intent=tuple(selection_intent),
+            client=client,
+            expires_at=value[2],
+        )
+
+    def encode_fallback_continuation(
+        self,
+        intent: FallbackPlaybackIntent,
+        *,
+        partition: bytes,
+        now: int | None = None,
+    ) -> str:
+        """Re-sign remaining attempts without extending the original deadline."""
+        current_time = int(time.time()) if now is None else now
+        if not _is_timestamp(current_time) or len(intent.options) < 1:
+            raise ValueError("invalid fallback continuation")
+        ttl = intent.expires_at - current_time
+        return self.encode(
+            "pf2",
+            partition=partition,
+            suffix=[
+                uuid.UUID(intent.candidate_id).bytes,
+                intent.transport,
+                [
+                    [
+                        uuid.UUID(option.provider_configuration_id).bytes,
+                        [uuid.UUID(item).bytes for item in option.locator_ids],
+                    ]
+                    for option in intent.options
+                ],
+                list(intent.selection_intent),
+                intent.client,
+            ],
+            ttl=ttl,
+            now=current_time,
+        )
 
     def decode_nzb_handoff_intent(
         self, token: str, *, partition: bytes, now: int | None = None

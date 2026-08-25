@@ -7,7 +7,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from urllib.parse import urlsplit
 
-import RTN
 from databases import Database
 from databases.backends.sqlite import SQLiteConnection
 from pydantic import (
@@ -45,6 +44,9 @@ from comet.core.operator_settings import (
 from comet.core.scrape import ScraperMode
 from comet.core.server_settings import ServerSettings
 from comet.core.sources import USENET_PLAYBACK_PROVIDER_KINDS
+from comet.results.config import LanguagesConfig as ResultLanguagesConfig
+from comet.results.config import ResultsConfig
+from comet.results.migrations import migrate_configuration_document
 from comet.usenet.nntp_config import parse_instance_servers, parse_personal_servers
 from comet.usenet.stremio_nntp_config import validate_handoff_config
 from comet.utils.text import has_ascii_control
@@ -1209,19 +1211,6 @@ rtn_settings_default = CometSettingsModel()
 rtn_ranking_default = DefaultRanking()
 
 
-class UserRtnOptions(BaseModel):
-    """RTN options exposed through user configuration."""
-
-    model_config = ConfigDict(strict=True, extra="forbid")
-
-    allow_english_in_languages: bool = (
-        rtn_settings_default.options.allow_english_in_languages
-    )
-    remove_unknown_languages: bool = (
-        rtn_settings_default.options.remove_unknown_languages
-    )
-
-
 class DebridServiceEntry(BaseModel):
     model_config = ConfigDict(strict=True)
 
@@ -1376,11 +1365,7 @@ class ConfigModel(BaseModel):
     playbackProviders: list[PlaybackProviderEntry] | None = None
     accounts: dict[str, dict] | None = None
     nativeAccessToken: str | None = None
-    cachedOnly: bool | None = False
-    removeTrash: bool | None = True
-    resultFormat: list[str] | None = Field(default_factory=lambda: ["all"])
-    maxResultsPerResolution: int | None = 0
-    maxSize: float | None = 0
+    results: ResultsConfig = Field(default_factory=ResultsConfig)
 
     # Legacy single-service fields
     debridService: str | None = "torrent"
@@ -1392,43 +1377,18 @@ class ConfigModel(BaseModel):
     scrapeDebridAccountTorrents: bool | None = False
 
     debridStreamProxyPassword: str | None = ""
-    languages: dict | None = Field(
-        default_factory=lambda: rtn_settings_default.languages.model_dump()
-    )
-    resolutions: dict | None = Field(
-        default_factory=lambda: rtn_settings_default.resolutions.model_dump()
-    )
-    options: UserRtnOptions | None = Field(default_factory=UserRtnOptions)
+    languages: ResultLanguagesConfig = Field(default_factory=ResultLanguagesConfig)
 
     @model_validator(mode="before")
     @classmethod
-    def discard_legacy_rank_threshold(cls, value):
-        if not isinstance(value, dict) or value.get("schemaVersion", 1) != 1:
-            return value
-        options = value.get("options")
-        if not isinstance(options, dict) or "remove_ranks_under" not in options:
-            return value
-        normalized = dict(value)
-        normalized["options"] = {
-            key: option
-            for key, option in options.items()
-            if key != "remove_ranks_under"
-        }
-        return normalized
+    def migrate_legacy_results(cls, value):
+        return migrate_configuration_document(value)
 
     @field_validator("schemaVersion", mode="before")
     def validate_schema_version(cls, value):
         if type(value) is not int or value not in {1, 2}:
             raise ValueError("unsupported configuration schema version")
         return value
-
-    @field_validator("maxResultsPerResolution")
-    def check_max_results_per_resolution(cls, v):
-        return max(v, 0)
-
-    @field_validator("maxSize")
-    def check_max_size(cls, v):
-        return max(float(v), 0)
 
     @field_validator("debridService")
     def check_debrid_service(cls, v):
@@ -1495,23 +1455,6 @@ class ConfigModel(BaseModel):
 default_config = ConfigModel().model_dump()
 default_config["rtnSettings"] = rtn_settings_default
 default_config["rtnRanking"] = rtn_ranking_default
-
-
-web_config = {
-    "resolutions": [resolution.value for resolution in RTN.extras.Resolution],
-    "resultFormat": [
-        "title",
-        "video_info",
-        "audio_info",
-        "quality_info",
-        "release_group",
-        "seeders",
-        "size",
-        "tracker",
-        "languages",
-        "subtitles",
-    ],
-}
 
 
 def native_usenet_sources(configuration: AppSettings) -> tuple[str, ...]:

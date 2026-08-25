@@ -3,7 +3,7 @@
 import asyncio
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -40,6 +40,7 @@ from comet.playback.manager import (
     NzbSourceError,
     PreparedPlaybackIntent,
     broker_nzb_sources,
+    create_fallback_playback_preparation,
     create_playback_preparation,
     poll_nzbdav,
     poll_stremthru_newz,
@@ -54,7 +55,7 @@ from comet.playback.manager import (
     resolve_prepared_asset,
 )
 from comet.playback.preparations import PlaybackPreparationRepository
-from comet.playback.tokens import CapabilityCodec
+from comet.playback.tokens import CapabilityCodec, FallbackPlaybackIntent
 from comet.services.lock import DistributedLock
 from comet.services.status_video import build_status_video_response
 from comet.services.streaming.manager import (
@@ -316,6 +317,11 @@ async def _serve_torrent_debrid(
                 client_ip=link_client_ip,
             )
         except DebridLinkGenerationError as error:
+            if error.retryable:
+                raise ProviderRuntimeError(
+                    "debrid_link_generation_failed",
+                    retryable=True,
+                ) from error
             return _secure_playback_response(
                 build_status_video_response(
                     error.status_keys,
@@ -324,8 +330,9 @@ async def _serve_torrent_debrid(
             )
         download_url = valid_download_url(download_url)
         if download_url is None:
-            return _secure_playback_response(
-                build_status_video_response([], default_key="UNKNOWN")
+            raise ProviderRuntimeError(
+                "provider_redirect_invalid",
+                retryable=True,
             )
         await cache_download_link_best_effort(
             database,
@@ -552,6 +559,40 @@ def _playback_url(b64config: str, capability: str, config: dict) -> str:
     compact_config = configuration_url_segment(config, b64config)
     path = f"{settings.STREMIO_API_PREFIX}/{compact_config}/playback/v2/{capability}"
     return f"{settings.PUBLIC_BASE_URL}{path}" if settings.PUBLIC_BASE_URL else path
+
+
+def _fallback_redirect_response(
+    fallback: FallbackPlaybackIntent | None,
+    *,
+    codec: CapabilityCodec,
+    partition: bytes,
+    b64config: str,
+    config: dict,
+) -> RedirectResponse | None:
+    """Advance exactly once while preserving the signed chain's deadline."""
+    if fallback is None or len(fallback.options) <= 1:
+        return None
+    try:
+        continuation = codec.encode_fallback_continuation(
+            replace(fallback, options=fallback.options[1:]),
+            partition=partition,
+        )
+    except ValueError:
+        return None
+    return RedirectResponse(
+        _playback_url(b64config, continuation, config),
+        status_code=307,
+        headers=_PLAYBACK_RESPONSE_HEADERS,
+    )
+
+
+def _provider_failure_allows_fallback(error: ProviderRuntimeError) -> bool:
+    return (
+        error.retryable
+        and not error.auth_failed
+        and not error.terminal
+        and not error.mutation_rejected
+    )
 
 
 async def _with_preparation_lock(
@@ -1183,8 +1224,14 @@ async def playback_v2(
     session = await http_client_manager.get_session()
     client_ip = get_client_ip(request)
     prepared: PreparedPlaybackIntent | None = None
+    fallback: FallbackPlaybackIntent | None = None
     try:
-        if capability.startswith("pi2."):
+        if capability.startswith("pf2."):
+            prepared, fallback = await create_fallback_playback_preparation(
+                capability, config, database, session, client_ip=client_ip
+            )
+            capability = prepared.capability
+        elif capability.startswith("pi2."):
             prepared = await create_playback_preparation(
                 capability, config, database, session, client_ip=client_ip
             )
@@ -1203,11 +1250,12 @@ async def playback_v2(
                 status_code=307,
                 headers=_PLAYBACK_RESPONSE_HEADERS,
             )
-        if not capability.startswith("pa2."):
+        elif capability.startswith("pa2."):
+            prepared = await resolve_prepared_asset(
+                capability, config, database, session, client_ip=client_ip
+            )
+        else:
             raise ValueError("unknown playback capability")
-        prepared = await resolve_prepared_asset(
-            capability, config, database, session, client_ip=client_ip
-        )
         provider_kind = prepared.preparation.provider_kind
         request.state.comet_source_type = (
             "torrent" if provider_kind in TORRENT_PROVIDER_KINDS else "usenet"
@@ -1503,6 +1551,16 @@ async def playback_v2(
                     ),
                     retry_after=(None if exc.auth_failed else exc.retry_after or 30),
                 )
+        if _provider_failure_allows_fallback(exc):
+            redirect = _fallback_redirect_response(
+                fallback,
+                codec=codec,
+                partition=partition,
+                b64config=b64config,
+                config=config,
+            )
+            if redirect is not None:
+                return redirect
         if exc.retryable:
             return _retryable_playback_response(exc.retry_after or 30)
         if exc.auth_failed or exc.terminal:
@@ -1520,6 +1578,16 @@ async def playback_v2(
                 operation=exc.operation,
                 exception=exc.__cause__ or exc,
             )
+        if exc.retryable and not exc.auth_failed:
+            redirect = _fallback_redirect_response(
+                fallback,
+                codec=codec,
+                partition=partition,
+                b64config=b64config,
+                config=config,
+            )
+            if redirect is not None:
+                return redirect
         return _usenet_failure_response(exc.code)
     except (EngineUnavailable, EngineNntpError, EngineArchiveError) as exc:
         if isinstance(exc, EngineUnavailable):
@@ -1580,6 +1648,15 @@ async def playback_v2(
                 )
             else:
                 retry_after = 2
+            redirect = _fallback_redirect_response(
+                fallback,
+                codec=codec,
+                partition=partition,
+                b64config=b64config,
+                config=config,
+            )
+            if redirect is not None:
+                return redirect
             return _usenet_failure_response(code, retry_after=retry_after)
         await PlaybackPreparationRepository(database).mark_failed(
             prepared.preparation.preparation_id,

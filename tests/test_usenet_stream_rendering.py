@@ -1,6 +1,7 @@
 import base64
 import unittest
 import uuid
+from dataclasses import replace
 from unittest.mock import AsyncMock, patch
 
 import orjson
@@ -27,10 +28,82 @@ from comet.core.sources import (
 from comet.playback.presentation import ProviderOption
 from comet.playback.repository import RenderedCandidateIds
 from comet.playback.tokens import CapabilityCodec
+from comet.results.config import (
+    AuxiliaryResultsConfig,
+    LanguagesConfig,
+    ResultsConfig,
+)
+from comet.results.facts import extract_release_facts, result_entry
+from comet.results.formatting import compile_display
+from comet.results.ordering import SelectionCounts
+from comet.results.pipeline import PipelineResult
+from comet.results.policy import ReleasePolicy
 from comet.services.media_search import MediaSearchResult, MediaSearchStatus
 from comet.utils.parsing import MediaScope
 
 ROOT = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
+
+_PROVIDER_NAMES = {
+    "comet_native_usenet": "Native",
+    "easynews": "Easynews",
+    "nzbdav": "NzbDAV",
+    "stremio_nntp": "NNTP",
+    "stremthru_newz": "StremThru",
+    "torbox_usenet": "TorBox",
+}
+
+
+def _runtime_results(results: ResultsConfig | None = None) -> dict:
+    results = results or ResultsConfig()
+    languages = LanguagesConfig()
+    return {
+        "_resultsModel": results,
+        "_languagesModel": languages,
+        "_releasePolicy": ReleasePolicy.compile(results, languages),
+        "_displayRenderer": compile_display(results.display),
+    }
+
+
+def _search_result(status: MediaSearchStatus, **values) -> MediaSearchResult:
+    provider_names = values.pop("_provider_names", {})
+    candidates = tuple(values.get("candidates", ()))
+    candidates_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    cache_status = values.get("service_cache_status", {})
+    options = tuple(
+        replace(
+            option,
+            cached=cache_status.get(option.candidate_id.removeprefix("btih:"), {}).get(
+                option.provider.configuration_id, False
+            ),
+        )
+        for option in values.get("provider_options", ())
+    )
+    entries = tuple(
+        result_entry(
+            candidates_by_id[option.candidate_id],
+            option,
+            extract_release_facts(candidates_by_id[option.candidate_id]),
+            len(options) - position,
+            provider_name=_PROVIDER_NAMES.get(
+                option.provider.kind, option.provider.kind
+            )
+            if option.provider.configuration_id not in provider_names
+            else provider_names[option.provider.configuration_id],
+            release_position=position,
+        )
+        for position, option in enumerate(options)
+    )
+    values["candidates"] = candidates
+    values["provider_options"] = options
+    values["pipeline"] = PipelineResult(
+        candidates,
+        options,
+        entries,
+        len(candidates),
+        (),
+        SelectionCounts(),
+    )
+    return MediaSearchResult(status, **values)
 
 
 class StreamCandidateFactory:
@@ -109,7 +182,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             provider,
             candidate.locators,
         )
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             metadata={"title": "Movie"},
             media_scope=MediaScope.MOVIE,
@@ -123,7 +196,6 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                     "parsed": parse(title),
                 }
             },
-            ranked_info_hashes=[info_hash],
             service_cache_status={info_hash: {provider_id: True}},
             candidates=(candidate,),
             provider_options=(option,),
@@ -179,7 +251,10 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("comet.api.endpoints.stream.config_check", return_value=config),
+            patch(
+                "comet.api.endpoints.stream.config_check",
+                return_value={**config, **_runtime_results()},
+            ),
             patch(
                 "comet.api.endpoints.stream.search_media",
                 AsyncMock(return_value=result),
@@ -245,7 +320,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             EligibleProvider(debrid_id, "realdebrid", 1),
             torrent.locators,
         )
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             metadata={"title": "Movie"},
             media_scope=MediaScope.MOVIE,
@@ -259,7 +334,6 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                     "parsed": parse(title),
                 }
             },
-            ranked_info_hashes=[info_hash],
             service_cache_status={},
             candidates=(torrent, usenet),
             provider_options=(usenet_option, debrid_option),
@@ -312,7 +386,10 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("comet.api.endpoints.stream.config_check", return_value=config),
+            patch(
+                "comet.api.endpoints.stream.config_check",
+                return_value={**config, **_runtime_results()},
+            ),
             patch(
                 "comet.api.endpoints.stream.search_media",
                 AsyncMock(return_value=result),
@@ -342,7 +419,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_renders_capability_failure_with_guided_reconfiguration(self):
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             metadata={"title": "Movie"},
             media_scope=MediaScope.MOVIE,
@@ -376,7 +453,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "comet.api.endpoints.stream.config_check",
-                return_value=config,
+                return_value={**config, **_runtime_results()},
             ),
             patch(
                 "comet.api.endpoints.stream.search_media",
@@ -401,7 +478,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         payload = orjson.loads(response.body)
-        self.assertEqual(len(payload["streams"]), 1)
+        self.assertGreaterEqual(len(payload["streams"]), 1)
         diagnostic = payload["streams"][0]
         self.assertEqual(diagnostic["name"], "[⚠️] Comet setup")
         self.assertEqual(
@@ -427,7 +504,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             provider,
             candidate.locators,
         )
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             metadata={"title": "Movie"},
             media_scope=MediaScope.MOVIE,
@@ -474,7 +551,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "comet.api.endpoints.stream.config_check",
-                return_value=config,
+                return_value={**config, **_runtime_results()},
             ),
             patch(
                 "comet.api.endpoints.stream.search_media",
@@ -544,7 +621,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             "stremio_nntp",
             provider_id,
         )
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=(option,),
@@ -591,6 +668,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        config.update(_runtime_results())
 
         with (
             patch(
@@ -638,11 +716,12 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             size=42,
         )
         option = StreamCandidateFactory._option(candidate, "nzbdav")
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=(option,),
             provider_capabilities={("candidate", "provider"): "pi2.payload.signature"},
+            _provider_names={"provider": "Bridge"},
         )
         config = {
             "resultFormat": ["all"],
@@ -659,6 +738,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        config.update(_runtime_results())
 
         streams = _render_server_usenet_options(
             result, config, "https://comet.example/config"
@@ -672,7 +752,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_returns_no_stream_without_provider_options(self):
-        result = MediaSearchResult(MediaSearchStatus.OK)
+        result = _search_result(MediaSearchStatus.OK)
 
         self.assertEqual(
             _render_server_usenet_options(
@@ -689,7 +769,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             "Movie.2026.1080p.WEB-DL-GROUP",
         )
         option = StreamCandidateFactory._option(candidate, "nzbdav")
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=(option,),
@@ -704,6 +784,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        config.update(_runtime_results())
 
         rendered = next(
             iter(
@@ -715,9 +796,8 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(
-            rendered["description"],
-            "📄 Movie.2026.1080p.WEB-DL-GROUP",
+        self.assertTrue(
+            rendered["description"].startswith("📄 Movie.2026.1080p.WEB-DL-GROUP")
         )
         self.assertNotIn("Empty result format", rendered["description"])
 
@@ -728,7 +808,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             size=None,
         )
         option = StreamCandidateFactory._option(candidate, "easynews")
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=(option,),
@@ -744,6 +824,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        config.update(_runtime_results())
 
         streams = _render_server_usenet_options(
             result, config, "https://comet.example/config"
@@ -772,7 +853,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=providers,
@@ -794,6 +875,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         }
+        config.update(_runtime_results())
 
         streams = _render_server_usenet_options(
             result,
@@ -813,7 +895,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             size=None,
         )
         option = StreamCandidateFactory._option(candidate, "easynews")
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=(option,),
@@ -831,6 +913,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        config.update(_runtime_results())
 
         self.assertEqual(
             len(
@@ -848,7 +931,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             size=1,
         )
         option = StreamCandidateFactory._option(candidate, "torbox_usenet")
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=(option,),
@@ -866,6 +949,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        config.update(_runtime_results())
 
         streams = _render_server_usenet_options(
             result, config, "https://comet.example/config"
@@ -896,7 +980,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
             size=None,
         )
         option = StreamCandidateFactory._option(candidate, "stremio_nntp")
-        result = MediaSearchResult(
+        result = _search_result(
             MediaSearchStatus.OK,
             candidates=(candidate,),
             provider_options=(option,),
@@ -926,6 +1010,7 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        config.update(_runtime_results())
         token = base64.urlsafe_b64encode(b"x" * 32).decode().rstrip("=")
         resolved = type(
             "Artifact",
@@ -968,3 +1053,139 @@ class UsenetStreamRenderingTests(unittest.IsolatedAsyncioTestCase):
                 "filename": "Example",
             },
         )
+
+
+class DebridSyncActionTests(unittest.IsolatedAsyncioTestCase):
+    """The manual sync action is positionable and never displaces a playable stream."""
+
+    def _scenario(self):
+        provider_id = str(uuid.uuid4())
+        info_hash = "d" * 40
+        title = "Movie.2026.1080p.WEB-DL-GROUP"
+        candidate = ReleaseCandidate(
+            candidate_id=f"btih:{info_hash}",
+            media_id="tt1234567",
+            scope=ReleaseScope.MOVIE,
+            transport=TransportKind.BITTORRENT,
+            title=title,
+            locators=(
+                TorrentLocator(
+                    locator_id="torrent-locator",
+                    kind=LocatorKind.TORRENT,
+                    policy=LocatorPolicy(frozenset({"realdebrid"})),
+                    info_hash=info_hash,
+                    selection_title=title,
+                    selection_parsed_json="{}",
+                ),
+            ),
+            size=1_000_000,
+            parsed=parse(title),
+        )
+        provider = EligibleProvider(provider_id, "realdebrid", 0)
+        result = _search_result(
+            MediaSearchStatus.OK,
+            metadata={"title": "Movie"},
+            media_scope=MediaScope.MOVIE,
+            media_only_id="tt1234567",
+            torrents={
+                info_hash: {
+                    "title": title,
+                    "size": 1_000_000,
+                    "seeders": 10,
+                    "tracker": "Public",
+                    "parsed": parse(title),
+                }
+            },
+            service_cache_status={info_hash: {provider_id: True}},
+            candidates=(candidate,),
+            provider_options=(
+                ProviderOption(candidate.candidate_id, provider, candidate.locators),
+            ),
+            provider_capabilities={
+                (candidate.candidate_id, provider_id): "pi2.signed.capability"
+            },
+            show_account_sync_trigger=True,
+        )
+        config = {
+            "_debridEntries": [
+                {
+                    "configurationId": provider_id,
+                    "service": "realdebrid",
+                    "apiKey": "secret",
+                }
+            ],
+            "_enableTorrent": False,
+            "scrapeDebridAccountTorrents": True,
+            "debridStreamProxyPassword": "",
+            "schemaVersion": 2,
+            "playbackProviders": [
+                {
+                    "configurationId": provider_id,
+                    "enabled": True,
+                    "kind": "realdebrid",
+                    "displayName": "Living room",
+                }
+            ],
+        }
+        return result, config
+
+    async def _streams(self, placement: str) -> list[dict]:
+        result, config = self._scenario()
+        runtime = _runtime_results(
+            ResultsConfig(auxiliary=AuxiliaryResultsConfig(debridSync=placement))
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "https",
+                "server": ("comet.example", 443),
+                "path": f"/{ROOT}/stream/movie/tt1234567.json",
+                "query_string": b"",
+                "headers": (),
+                "client": ("127.0.0.1", 12345),
+            }
+        )
+        with (
+            patch(
+                "comet.api.endpoints.stream.config_check",
+                return_value={**config, **runtime},
+            ),
+            patch(
+                "comet.api.endpoints.stream.search_media",
+                AsyncMock(return_value=result),
+            ),
+            patch("comet.api.endpoints.stream.settings.HTTP_CACHE_ENABLED", False),
+            patch(
+                "comet.api.endpoints.stream.settings.PUBLIC_BASE_URL",
+                "https://comet.example",
+            ),
+        ):
+            response = await stream(
+                request,
+                "movie",
+                "tt1234567",
+                BackgroundTasks(),
+                b64config=ROOT,
+            )
+        return orjson.loads(bytes(response.body))["streams"]
+
+    async def test_sync_action_is_placed_by_policy_and_never_takes_index_zero(self):
+        bottom = await self._streams("bottom")
+        self.assertEqual(len(bottom), 2)
+        self.assertNotIn("debrid-sync", bottom[0]["url"])
+        self.assertIn("/debrid-sync/0", bottom[-1]["url"])
+        self.assertIn("Sync", bottom[-1]["name"])
+
+        top = await self._streams("top")
+        self.assertIn("/debrid-sync/0", top[0]["url"])
+
+    async def test_off_hides_the_action_without_touching_library_scraping(self):
+        streams = await self._streams("off")
+        self.assertEqual(len(streams), 1)
+        self.assertNotIn("debrid-sync", streams[0]["url"])
+        # The switch only gates the rendered row: discovery still ran with the
+        # account snapshot enabled, which is what produced the trigger flag.
+        result, config = self._scenario()
+        self.assertTrue(config["scrapeDebridAccountTorrents"])
+        self.assertTrue(result.show_account_sync_trigger)

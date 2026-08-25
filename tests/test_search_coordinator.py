@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from databases import Database
+from RTN import parse
 
 from comet.core.capabilities import (
     CapabilityPlan,
@@ -34,7 +35,11 @@ from comet.core.sources import (
 from comet.discovery import manager as discovery_manager
 from comet.discovery.capabilities import DiscoveryBranchFingerprint
 from comet.discovery.manager import SearchCoordinator
-from comet.discovery.models import DiscoveryBatch, MediaQuery
+from comet.discovery.models import (
+    CandidateNormalizationResult,
+    DiscoveryBatch,
+    MediaQuery,
+)
 from comet.services.lock import DistributedLock
 from comet.usenet.access import NativeAccessAuthorizer
 
@@ -125,6 +130,25 @@ def _torrent_plan(
 
 
 class SearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_typed_normalization_propagates_found_and_guard_counts(self):
+        adapter = FakeAdapter(
+            DiscoveryBatch(
+                candidates=(_torrent_candidate(),),
+                coverage=frozenset({"bittorrent"}),
+            )
+        )
+
+        async def reject(_candidates):
+            return CandidateNormalizationResult((), 1, (("title", 1),))
+
+        result = await SearchCoordinator(
+            {"source": adapter}, candidate_normalizer=reject
+        ).search(MediaQuery("tt1", "movie"), _torrent_plan("source"))
+
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(result.found_count, 1)
+        self.assertEqual(result.rejection_counts, (("title", 1),))
+
     async def test_only_reachable_sources_are_called_and_partial_failure_is_safe(self):
         plan = _torrent_plan("ok", "failed")
         successful = FakeAdapter(
@@ -379,6 +403,38 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _torrent_candidate().candidate_id,
         )
 
+    async def test_raw_persistence_is_normalized_again_on_a_warm_read(self):
+        adapter = FakeAdapter(
+            DiscoveryBatch(
+                candidates=(_torrent_candidate(),),
+                coverage=frozenset({"bittorrent"}),
+            )
+        )
+        calls = 0
+
+        async def normalize(candidates):
+            nonlocal calls
+            calls += 1
+            return CandidateNormalizationResult(
+                tuple(
+                    replace(
+                        candidate,
+                        parsed=parse("Movie.2026.1080p.WEB-DL"),
+                    )
+                    for candidate in candidates
+                ),
+                len(candidates),
+            )
+
+        coordinator = self.coordinator(adapter, candidate_normalizer=normalize)
+        cold = await self.search(coordinator)
+        warm = await self.search(coordinator)
+
+        self.assertEqual(len(adapter.contexts), 1)
+        self.assertEqual(calls, 2)
+        self.assertEqual(cold.candidates[0].parsed.resolution, "1080p")
+        self.assertEqual(warm.candidates[0].parsed.resolution, "1080p")
+
     async def test_source_cardinality_is_preserved_through_persistence(self):
         base = _torrent_candidate()
         candidates = tuple(
@@ -554,7 +610,9 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(lock_attempts, 1)
         self.assertEqual(len(adapter.contexts), 1)
-        self.assertEqual(normalization_count, 1)
+        # Raw discovery is cached; request-specific normalization runs once per
+        # consumer after aggregation so rejection totals remain reproducible.
+        self.assertEqual(normalization_count, 2)
         self.assertTrue(all(len(result.candidates) == 1 for result in results))
 
     async def test_cancelled_waiter_does_not_cancel_shared_local_work(self):
@@ -644,7 +702,9 @@ class CachedSearchCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(lock_attempts, 2)
         self.assertEqual(len(adapter.contexts), 1)
-        self.assertEqual(normalization_count, 1)
+        # The database singleflight shares discovery I/O, not request-local
+        # normalization/aggregate diagnostics.
+        self.assertEqual(normalization_count, 2)
         self.assertTrue(all(len(result.candidates) == 1 for result in results))
 
     async def test_concurrent_failure_does_not_cascade_retries(self):

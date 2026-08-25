@@ -5,11 +5,15 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from comet.core.config_codec import MAX_CONFIG_JSON_BYTES
 from comet.core.models import ConfigModel
 from comet.core.settings_catalog import SettingCatalogEntry
+from comet.results.config import DisplayConfig
+from comet.results.formatting import compile_display
+from comet.results.migrations import migrate_configuration_document
+from comet.results.policy import ReleasePolicy
 
 SettingValue = Any
 
@@ -63,11 +67,22 @@ class ConfiguratorCapabilities(StrictModel):
     stremio_api_prefix: str
 
 
+class ResultsPreviewData(StrictModel):
+    name: str
+    description: str
+
+
 class ConfiguratorBootstrapData(StrictModel):
     default_configuration: ConfigModel
     capabilities: ConfiguratorCapabilities
-    resolutions: list[str]
-    result_formats: list[str]
+    result_fields: list[str]
+    result_sort_keys: list[str]
+    result_scopes: list[str]
+    result_sort_presets: dict[str, list[dict[str, str]]]
+    result_sort_vocabulary: dict[str, list[str]]
+    result_policy_fields: list[str]
+    result_facets: dict[str, list[str]]
+    result_display_presets: dict[str, ResultsPreviewData]
     languages: dict[str, str]
     debrid_services: list[str]
     native_usenet_sources: list[str]
@@ -89,7 +104,23 @@ class ConfigValidationRequest(StrictModel):
             raise ValueError(
                 f"configuration exceeds the {MAX_CONFIG_JSON_BYTES // 1024} KiB JSON limit"
             )
-        return value
+        # Documents submitted to this compatibility endpoint predate `results`
+        # unless they carry it explicitly. New configurators always submit the
+        # canonical root, so this keeps old URL edits on legacy-safe defaults.
+        return migrate_configuration_document(value, legacy_if_results_missing=True)
+
+    @model_validator(mode="after")
+    def validate_compiled_results(self):
+        ReleasePolicy.compile(
+            self.configuration.results,
+            self.configuration.languages,
+        )
+        compile_display(self.configuration.results.display)
+        return self
+
+
+class ResultsPreviewRequest(StrictModel):
+    display: DisplayConfig
 
 
 class OperationalEventData(StrictModel):

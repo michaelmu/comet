@@ -17,6 +17,11 @@ from comet.core.sources import (
     TransportKind,
 )
 from comet.playback.presentation import ProviderOption
+from comet.results.config import ResultsConfig
+from comet.results.facts import extract_release_facts, result_entry
+from comet.results.formatting import compile_display
+from comet.results.ordering import SelectionCounts
+from comet.results.pipeline import PipelineResult
 from comet.services.media_search import MediaSearchResult, MediaSearchStatus
 
 
@@ -66,11 +71,27 @@ def _server_result(
         EligibleProvider(provider_id, provider_kind, 0),
         candidate.locators,
     )
+    entry = result_entry(
+        candidate,
+        option,
+        extract_release_facts(candidate),
+        0,
+        provider_name=("My NzbDAV" if provider_kind == "nzbdav" else "Easynews"),
+    )
+    pipeline = PipelineResult(
+        (candidate,),
+        (option,),
+        (entry,),
+        1,
+        (),
+        SelectionCounts(),
+    )
     return provider_id, MediaSearchResult(
         MediaSearchStatus.OK,
         candidates=(candidate,),
         provider_options=(option,),
         provider_capabilities={(candidate.candidate_id, provider_id): "pi2.capability"},
+        pipeline=pipeline,
     )
 
 
@@ -89,6 +110,7 @@ def test_server_usenet_rendering_carries_truthful_chilllink_metadata():
             }
         ],
     }
+    config["_displayRenderer"] = compile_display(ResultsConfig().display)
 
     streams = _render_server_usenet_options(
         search_result,
@@ -101,8 +123,9 @@ def test_server_usenet_rendering_carries_truthful_chilllink_metadata():
     assert rendered["_chilllink"] == [
         "📰 My NzbDAV",
         "Usenet",
-        "💾 2.0 GB",
-        "🔎 Usenet",
+        "SDR",
+        "2.0 GB",
+        "Usenet",
     ]
     assert "cached" not in " ".join(rendered["_chilllink"]).lower()
 
@@ -131,6 +154,7 @@ def test_server_usenet_rendering_carries_kodi_metadata_without_fake_availability
             }
         ],
     }
+    config["_displayRenderer"] = compile_display(ResultsConfig().display)
 
     stream = next(
         iter(
@@ -148,9 +172,9 @@ def test_server_usenet_rendering_carries_kodi_metadata_without_fake_availability
     assert kodi_meta["height"] == 1080
     assert kodi_meta["codec"] == "H.265"
     assert kodi_meta["languages"] == ["en"]
-    assert kodi_meta["sizeInfo"] == "Size: 2.0 GB"
-    assert kodi_meta["videoInfo"] == "H.265"
-    assert kodi_meta["audioInfo"] == "DDP • 5.1"
+    assert kodi_meta["sizeInfo"] == "2.0 GB"
+    assert kodi_meta["videoInfo"] == "h.265 • SDR"
+    assert kodi_meta["audioInfo"] == "ddp • 5.1"
     assert stream["name"] == "[Easynews NZB] 1080p | 2.0 GB | H.265 | DDP • 5.1"
     assert stream["description"] == (
         "Movie.2026.1080p.WEB-DL\n"

@@ -27,9 +27,11 @@ class DebridLinkGenerationError(DebridError):
         *,
         error_code: str | None = None,
         upstream_error_code: str | None = None,
+        retryable: bool = False,
     ):
         self.error_code = error_code
         self.upstream_error_code = upstream_error_code
+        self.retryable = retryable
         super().__init__(message)
 
     @property

@@ -315,9 +315,15 @@ class ApiV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bootstrap.status_code, 200, bootstrap.text)
         data = bootstrap.json()["data"]
         self.assertEqual(data["default_configuration"]["schemaVersion"], 1)
-        self.assertNotIn(
-            "remove_ranks_under",
-            data["default_configuration"]["options"],
+        self.assertNotIn("options", data["default_configuration"])
+        self.assertEqual(
+            data["default_configuration"]["results"]["display"]["preset"],
+            "default",
+        )
+        self.assertIn("cache.icon", data["result_fields"])
+        self.assertEqual(
+            data["default_configuration"]["languages"]["unknown"],
+            "allow",
         )
         self.assertNotIn("rtnSettings", data["default_configuration"])
         self.assertNotIn("rtnRanking", data["default_configuration"])
@@ -411,6 +417,31 @@ class ApiV1Tests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(duplicate_p2p.status_code, 422)
         self.assertEqual(duplicate_p2p.json()["error"]["code"], "validation_failed")
+
+        preview = await self.client.post(
+            "/api/v1/configure/results/preview",
+            headers={"Origin": "http://testserver"},
+            json={"display": {"preset": "compact"}},
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["data"]["name"], "[RD⚡] Comet 2160p")
+
+        invalid_preview = await self.client.post(
+            "/api/v1/configure/results/preview",
+            headers={"Origin": "http://testserver"},
+            json={
+                "display": {
+                    "preset": "custom",
+                    "name": "{?title}{?video}",
+                    "description": "ok",
+                }
+            },
+        )
+        self.assertEqual(invalid_preview.status_code, 422)
+        self.assertEqual(
+            invalid_preview.json()["error"]["code"],
+            "result_template_invalid",
+        )
 
         cross_site_guard = await self.client.post(
             "/api/v1/configure/validate",

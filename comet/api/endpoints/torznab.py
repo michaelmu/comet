@@ -454,7 +454,12 @@ def _serialize_items(
     category_id = "2000" if media_type == "movie" else "5000"
     category_name = "Movies" if media_type == "movie" else "TV"
 
-    for info_hash in result.ranked_info_hashes:
+    info_hashes = dict.fromkeys(
+        entry.facts.candidate_id.removeprefix("btih:")
+        for entry in result.pipeline.entries
+        if entry.facts.candidate_id.startswith("btih:")
+    )
+    for info_hash in info_hashes:
         torrent = result.torrents[info_hash]
         title = _clean_xml(torrent["title"])
         size = torrent["size"] if torrent["size"] is not None else 0

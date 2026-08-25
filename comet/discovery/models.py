@@ -57,3 +57,12 @@ class DiscoveryBatch:
     diagnostics: tuple[str, ...] = ()
     coverage: frozenset[str] = field(default_factory=frozenset)
     inflight: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateNormalizationResult:
+    """Normalized candidates plus aggregate-only correctness diagnostics."""
+
+    candidates: tuple[ReleaseCandidate, ...]
+    found_count: int
+    rejection_counts: tuple[tuple[str, int], ...] = ()

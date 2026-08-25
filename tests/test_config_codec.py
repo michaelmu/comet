@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import zlib
 
 import orjson
@@ -6,6 +7,7 @@ import pytest
 
 from comet.core.config_codec import (
     CONFIGURATION_DICTIONARY_V1,
+    CONFIGURATION_DICTIONARY_V2,
     MAX_CONFIG_JSON_BYTES,
     ConfigurationCodecError,
     decode_configuration_segment,
@@ -93,6 +95,35 @@ def _representative_configuration() -> bytes:
     )
 
 
+def test_codec_dictionaries_are_immutable_versioned_protocol_assets():
+    assert hashlib.sha256(CONFIGURATION_DICTIONARY_V1).hexdigest() == (
+        "4225e73a998f463c9c41dc0a7e3441caf55309d7b461c43311baf164c0b68ccd"
+    )
+    assert hashlib.sha256(CONFIGURATION_DICTIONARY_V2).hexdigest() == (
+        "14069ff5eb44e543180b845abd2ee4c88ce4ceb3fd67ed709e2d7e10ea097472"
+    )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_plain_url_legacy_scalars_coerce_before_strict_results(schema_version):
+    document = orjson.dumps(
+        {
+            "schemaVersion": schema_version,
+            "cachedOnly": "true",
+            "removeTrash": "false",
+            "maxResultsPerResolution": "5",
+            "maxSize": "100",
+        }
+    )
+    config = config_check(_legacy(document))
+
+    assert config is not None
+    assert config["results"]["filters"]["removeTrash"] is False
+    assert config["results"]["filters"]["ranges"]["playbackSize"]["max"] == 100.0
+    assert config["results"]["limits"] == [{"by": "resolution", "max": 5}]
+    assert config["results"]["filters"]["rules"][0]["id"] == "legacy-cached-only"
+
+
 def test_feat_usenet_v2_segment_round_trips_and_materially_reduces_urls():
     document = _representative_configuration()
     legacy = _legacy(document)
@@ -103,6 +134,40 @@ def test_feat_usenet_v2_segment_round_trips_and_materially_reduces_urls():
     assert decode_configuration_segment(encoded) == document
     assert len(encoded) < len(legacy) * 0.35
     assert config_check(encoded) is not None
+
+
+def test_canonical_results_configuration_uses_measured_z2_dictionary():
+    document = orjson.dumps(
+        {
+            "schemaVersion": 2,
+            "results": {
+                "filters": {
+                    "dimensions": {
+                        "resolution": {"only": ["2160p", "1080p"]},
+                        "visual": {"exclude": ["3d", "dolbyVision"]},
+                    },
+                    "ranges": {"seeders": {"min": 3, "scope": "needsDownload"}},
+                },
+                "sort": [
+                    {"key": "cached", "direction": "desc"},
+                    {"key": "resolution", "direction": "desc"},
+                ],
+                "alternatives": {
+                    "cached": "best",
+                    "uncached": "best",
+                    "usenet": "best",
+                    "hideUncachedWhenCached": True,
+                    "direct": "unlessCached",
+                    "fallback": True,
+                },
+            },
+        }
+    )
+
+    encoded = encode_configuration_segment(document)
+
+    assert encoded.startswith("z2.")
+    assert decode_configuration_segment(encoded) == document
 
 
 def test_feat_usenet_v2_historical_segment_is_upgraded_for_derived_urls():

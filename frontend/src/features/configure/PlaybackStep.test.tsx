@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ConfiguratorBootstrapData } from "../../api/generated/contracts";
 import { PlaybackStep } from "./PlaybackStep";
+import { bootstrapFixture } from "./testing";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -21,23 +21,10 @@ const services = [
   "pikpak",
 ];
 
-const bootstrap = {
-  capabilities: {
-    native_usenet: false,
-    proxy_debrid_stream: true,
-    stremio_api_prefix: "",
-    torrent_streams: true,
-    usenet: false,
-  },
+const bootstrap = bootstrapFixture({
+  capabilities: { proxy_debrid_stream: true },
   debrid_services: services,
-  default_configuration: {},
-  languages: {},
-  native_usenet_sources: [],
-  resolutions: [],
-  result_formats: [],
-  usenet_provider_kinds: [],
-  usenet_source_kinds: [],
-} as ConfiguratorBootstrapData;
+});
 
 describe("PlaybackStep", () => {
   it("offers the account and credential pages for every debrid service", () => {

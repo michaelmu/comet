@@ -21,25 +21,140 @@ export interface BindingDraft {
   options: Record<string, unknown>;
 }
 
+export type ResultScope =
+  | "all"
+  | "cached"
+  | "uncached"
+  | "directTorrent"
+  | "needsDownload"
+  | "torrent"
+  | "usenet";
+export type SortDirection = "asc" | "desc";
+export type SortKey =
+  | "resolution"
+  | "cached"
+  | "language"
+  | "keyword"
+  | "preferenceRule"
+  | "rank"
+  | "quality"
+  | "videoCodec"
+  | "hdr"
+  | "audio"
+  | "channels"
+  | "subtitles"
+  | "size"
+  | "seeders"
+  | "age"
+  | "provider"
+  | "transport"
+  | "source"
+  | "releaseGroup"
+  | "private";
+export type DimensionKey =
+  | "resolution"
+  | "quality"
+  | "visual"
+  | "videoCodec"
+  | "audio"
+  | "channels"
+  | "subtitles"
+  | "releaseType"
+  | "releaseGroup"
+  | "edition"
+  | "flags"
+  | "source"
+  | "transport"
+  | "providerKind"
+  | "providerId";
+export type RangeKey = "playbackSize" | "releaseSize" | "seeders" | "ageDays" | "bitrate";
+
+export interface FacetDraft {
+  exclude: string[];
+  only: string[];
+}
+
+export interface RangeDraft {
+  max?: number;
+  min?: number;
+  scope: ResultScope;
+}
+
+export interface KeywordPatternDraft {
+  mode: "word" | "phrase" | "wildcard";
+  target: "title" | "releaseGroup" | "source";
+  value: string;
+}
+
+export interface PredicateDraft {
+  field: string;
+  op: string;
+  value?: string | number | boolean;
+  values?: Array<string | number | boolean>;
+}
+
+export interface PolicyRuleDraft {
+  action: "exclude" | "require" | "prefer" | "addLanguage";
+  all: PredicateDraft[];
+  id?: string;
+  language?: string;
+}
+
+export interface SortCriterionDraft {
+  direction: SortDirection;
+  key: SortKey;
+  order?: string[];
+  scope: ResultScope;
+}
+
+export interface LimitRuleDraft {
+  by: "total" | "resolution" | "quality" | "provider" | "transport" | "source" | "releaseGroup";
+  max: number;
+}
+
+export interface ResultsDraft {
+  alternatives: {
+    cached: "all" | "best";
+    direct: "always" | "unlessCached";
+    fallback: boolean;
+    hideUncachedWhenCached: boolean;
+    uncached: "all" | "best";
+    usenet: "all" | "best";
+  };
+  auxiliary: {
+    debridSync: "off" | "top" | "bottom";
+    errors: "off" | "top" | "bottom";
+    filterSummary: "off" | "whenEmpty" | "top" | "bottom";
+  };
+  display: {
+    description?: string;
+    name?: string;
+    preset: "default" | "compact" | "technical" | "custom";
+  };
+  filters: {
+    dimensions: Record<DimensionKey, FacetDraft>;
+    keywords: Record<"exclude" | "require" | "prefer", KeywordPatternDraft[]>;
+    ranges: Partial<Record<RangeKey, RangeDraft>>;
+    removeTrash: boolean;
+    rules: PolicyRuleDraft[];
+  };
+  limits: LimitRuleDraft[];
+  sort: SortCriterionDraft[];
+}
+
 export interface ConfigureFormValues {
-  allowEnglishInLanguages: boolean;
+  allowedLanguages: string[];
   bittorrentEnabled: boolean;
-  cachedOnly: boolean;
   debridServices: DebridDraft[];
   excludedLanguages: string[];
-  maxResultsPerResolution: number;
-  maxSizeGb: number;
   nativeAccessToken: string;
   preferredLanguages: string[];
   proxyPassword: string;
-  removeTrash: boolean;
-  removeUnknownLanguages: boolean;
   requiredLanguages: string[];
-  allowedLanguages: string[];
-  resolutions: string[];
-  resultFormat: string[];
+  results: ResultsDraft;
   schemaVersion: 1 | 2;
   scrapeDebridAccountTorrents: boolean;
+  unknownLanguages: "allow" | "exclude";
   usenetEnabled: boolean;
   usenetProviders: BindingDraft[];
   usenetSources: BindingDraft[];
@@ -47,10 +162,39 @@ export interface ConfigureFormValues {
 
 export const DIRECT_TORRENT_SERVICE = "direct_torrent";
 export const NATIVE_USENET_PROVIDER = "comet_native_usenet";
+export const DIMENSION_KEYS: readonly DimensionKey[] = [
+  "resolution",
+  "quality",
+  "visual",
+  "videoCodec",
+  "audio",
+  "channels",
+  "subtitles",
+  "releaseType",
+  "releaseGroup",
+  "edition",
+  "flags",
+  "source",
+  "transport",
+  "providerKind",
+  "providerId",
+];
+export const RANGE_KEYS: readonly RangeKey[] = [
+  "playbackSize",
+  "releaseSize",
+  "seeders",
+  "ageDays",
+  "bitrate",
+];
+const DEFAULT_SORT: readonly SortCriterionDraft[] = [
+  { direction: "desc", key: "resolution", scope: "all" },
+  { direction: "desc", key: "cached", scope: "all" },
+  { direction: "desc", key: "language", scope: "all" },
+  { direction: "desc", key: "rank", scope: "all" },
+  { direction: "asc", key: "provider", scope: "all" },
+];
 
-type MutableConfiguration = {
-  -readonly [Key in keyof ConfigModel]: ConfigModel[Key];
-};
+type MutableConfiguration = { -readonly [Key in keyof ConfigModel]: ConfigModel[Key] };
 
 function id(): string {
   return crypto.randomUUID();
@@ -60,6 +204,116 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
     : [];
+}
+
+function resultsDraft(
+  configuration: ConfigModel,
+  bootstrap: ConfiguratorBootstrapData,
+): ResultsDraft {
+  const defaults = bootstrap.default_configuration.results ?? {};
+  const source = configuration.results ?? defaults;
+  const filters = source.filters ?? {};
+  const defaultFilters = defaults.filters ?? {};
+  const dimensions = filters.dimensions ?? {};
+  const defaultDimensions = defaultFilters.dimensions ?? {};
+  const keywords = filters.keywords ?? {};
+  const defaultKeywords = defaultFilters.keywords ?? {};
+  const alternatives = source.alternatives ?? {};
+  const defaultAlternatives = defaults.alternatives ?? {};
+  const auxiliary = source.auxiliary ?? {};
+  const defaultAuxiliary = defaults.auxiliary ?? {};
+  const display = source.display ?? {};
+  const defaultDisplay = defaults.display ?? {};
+  const displayDescription = display.description ?? defaultDisplay.description;
+  const displayName = display.name ?? defaultDisplay.name;
+  return {
+    alternatives: {
+      cached: alternatives.cached ?? defaultAlternatives.cached ?? "all",
+      direct: alternatives.direct ?? defaultAlternatives.direct ?? "always",
+      fallback: alternatives.fallback ?? defaultAlternatives.fallback ?? false,
+      hideUncachedWhenCached:
+        alternatives.hideUncachedWhenCached ?? defaultAlternatives.hideUncachedWhenCached ?? false,
+      uncached: alternatives.uncached ?? defaultAlternatives.uncached ?? "all",
+      usenet: alternatives.usenet ?? defaultAlternatives.usenet ?? "all",
+    },
+    auxiliary: {
+      debridSync: auxiliary.debridSync ?? defaultAuxiliary.debridSync ?? "bottom",
+      errors: auxiliary.errors ?? defaultAuxiliary.errors ?? "bottom",
+      filterSummary: auxiliary.filterSummary ?? defaultAuxiliary.filterSummary ?? "whenEmpty",
+    },
+    display: {
+      ...(displayDescription ? { description: displayDescription } : {}),
+      ...(displayName ? { name: displayName } : {}),
+      preset: display.preset ?? defaultDisplay.preset ?? "default",
+    },
+    filters: {
+      dimensions: Object.fromEntries(
+        DIMENSION_KEYS.map((key) => [
+          key,
+          {
+            exclude: [...(dimensions[key]?.exclude ?? defaultDimensions[key]?.exclude ?? [])],
+            only: [...(dimensions[key]?.only ?? defaultDimensions[key]?.only ?? [])],
+          },
+        ]),
+      ) as Record<DimensionKey, FacetDraft>,
+      keywords: {
+        exclude: (keywords.exclude ?? defaultKeywords.exclude ?? []).map((item) => ({
+          mode: item.mode ?? "phrase",
+          target: item.target ?? "title",
+          value: item.value,
+        })),
+        prefer: (keywords.prefer ?? defaultKeywords.prefer ?? []).map((item) => ({
+          mode: item.mode ?? "phrase",
+          target: item.target ?? "title",
+          value: item.value,
+        })),
+        require: (keywords.require ?? defaultKeywords.require ?? []).map((item) => ({
+          mode: item.mode ?? "phrase",
+          target: item.target ?? "title",
+          value: item.value,
+        })),
+      },
+      ranges: Object.fromEntries(
+        RANGE_KEYS.flatMap((key) => {
+          const range = filters.ranges?.[key] ?? defaultFilters.ranges?.[key];
+          return range
+            ? [
+                [
+                  key,
+                  {
+                    ...(range.max == null ? {} : { max: range.max }),
+                    ...(range.min == null ? {} : { min: range.min }),
+                    scope: range.scope ?? "all",
+                  },
+                ],
+              ]
+            : [];
+        }),
+      ),
+      removeTrash: filters.removeTrash ?? defaultFilters.removeTrash ?? true,
+      rules: (filters.rules ?? defaultFilters.rules ?? []).map((rule) => ({
+        action: rule.action,
+        all: rule.all.map((predicate) => ({
+          field: predicate.field,
+          op: predicate.op,
+          ...(predicate.value == null ? {} : { value: predicate.value }),
+          ...(predicate.values == null ? {} : { values: [...predicate.values] }),
+        })),
+        ...(rule.id ? { id: rule.id } : {}),
+        ...(rule.language ? { language: rule.language } : {}),
+      })),
+    },
+    limits: (source.limits ?? defaults.limits ?? []).map((rule) => ({
+      by: rule.by,
+      max: rule.max,
+    })),
+    sort: (source.sort ?? defaults.sort ?? DEFAULT_SORT).map((criterion) => ({
+      direction: criterion.direction ?? "desc",
+      key: criterion.key,
+      ...(criterion.order ? { order: [...criterion.order] } : {}),
+      scope: criterion.scope ?? "all",
+    })),
+  };
 }
 
 export function formValues(
@@ -112,34 +366,22 @@ export function formValues(
   }
 
   const languages = configuration.languages ?? {};
-  const options = configuration.options ?? {};
   return {
-    allowEnglishInLanguages: options.allow_english_in_languages === true,
     allowedLanguages: stringArray(languages.allowed),
     bittorrentEnabled:
       schemaVersion === 1
         ? bootstrap.capabilities.torrent_streams
         : (configuration.enabledTransports ?? []).includes("bittorrent"),
-    cachedOnly: configuration.cachedOnly === true,
     debridServices,
     excludedLanguages: stringArray(languages.exclude),
-    maxResultsPerResolution: configuration.maxResultsPerResolution ?? 0,
-    maxSizeGb: (configuration.maxSize ?? 0) / 1_073_741_824,
     nativeAccessToken: configuration.nativeAccessToken ?? "",
     preferredLanguages: stringArray(languages.preferred),
     proxyPassword: configuration.debridStreamProxyPassword ?? "",
-    removeTrash: configuration.removeTrash !== false,
-    removeUnknownLanguages: options.remove_unknown_languages === true,
     requiredLanguages: stringArray(languages.required),
-    resolutions: bootstrap.resolutions.filter(
-      (resolution) => configuration.resolutions?.[resolution] !== false,
-    ),
-    resultFormat:
-      configuration.resultFormat?.[0] === "all"
-        ? [...bootstrap.result_formats]
-        : [...(configuration.resultFormat ?? bootstrap.result_formats)],
+    results: resultsDraft(configuration, bootstrap),
     schemaVersion,
     scrapeDebridAccountTorrents: configuration.scrapeDebridAccountTorrents === true,
+    unknownLanguages: languages.unknown ?? "allow",
     usenetEnabled:
       schemaVersion === 2 && (configuration.enabledTransports ?? []).includes("usenet"),
     usenetProviders: providers
@@ -163,20 +405,123 @@ function bindingDraft(binding: PlaybackProviderEntry | DiscoverySourceEntry): Bi
 }
 
 export function emptyBinding(kind: string, displayName: string): BindingDraft {
-  return {
-    configurationId: id(),
-    displayName,
-    enabled: true,
-    kind,
-    options: {},
-  };
+  return { configurationId: id(), displayName, enabled: true, kind, options: {} };
 }
 
-function compactResultFormat(selected: string[], all: readonly string[]): string[] {
-  const selectedFields = new Set(selected);
-  return selectedFields.size === all.length && all.every((value) => selectedFields.has(value))
-    ? ["all"]
-    : selected;
+const LEGACY_RESULT_KEYS = [
+  "cachedOnly",
+  "removeTrash",
+  "resultFormat",
+  "maxResultsPerResolution",
+  "maxSize",
+  "resolutions",
+  "options",
+  "sortCachedUncachedTogether",
+  "deduplicateStreams",
+] as const;
+
+function canonicalLoaded(loaded?: ConfigModel): ConfigModel {
+  const document: Record<string, unknown> = { ...(loaded ?? {}) };
+  for (const key of LEGACY_RESULT_KEYS) delete document[key];
+  return document as ConfigModel;
+}
+
+function compactResults(results: ResultsDraft): NonNullable<ConfigModel["results"]> {
+  const dimensions = Object.fromEntries(
+    Object.entries(results.filters.dimensions).flatMap(([key, facet]) =>
+      facet.only.length || facet.exclude.length
+        ? [
+            [
+              key,
+              {
+                ...(facet.only.length ? { only: facet.only } : {}),
+                ...(facet.exclude.length ? { exclude: facet.exclude } : {}),
+              },
+            ],
+          ]
+        : [],
+    ),
+  );
+  const ranges = Object.fromEntries(
+    Object.entries(results.filters.ranges).map(([key, range]) => [
+      key,
+      {
+        ...(range?.min == null ? {} : { min: range.min }),
+        ...(range?.max == null ? {} : { max: range.max }),
+        ...(range?.scope && range.scope !== "all" ? { scope: range.scope } : {}),
+      },
+    ]),
+  );
+  const keywords = Object.fromEntries(
+    Object.entries(results.filters.keywords).flatMap(([action, patterns]) => {
+      const compact = patterns
+        .filter(({ value }) => value.trim() !== "")
+        .map(({ mode, target, value }) => ({
+          value,
+          ...(mode === "phrase" ? {} : { mode }),
+          ...(target === "title" ? {} : { target }),
+        }));
+      return compact.length ? [[action, compact]] : [];
+    }),
+  );
+  const filters = {
+    ...(results.filters.removeTrash ? {} : { removeTrash: false }),
+    ...(Object.keys(dimensions).length ? { dimensions } : {}),
+    ...(Object.keys(ranges).length ? { ranges } : {}),
+    ...(Object.keys(keywords).length ? { keywords } : {}),
+    ...(results.filters.rules.length ? { rules: results.filters.rules } : {}),
+  };
+  const sort = results.sort.map(({ direction, key, order, scope }) => ({
+    key,
+    ...(direction === "desc" ? {} : { direction }),
+    ...(scope === "all" ? {} : { scope }),
+    ...(order?.length ? { order } : {}),
+  }));
+  const alternatives = {
+    ...(results.alternatives.cached === "all" ? {} : { cached: results.alternatives.cached }),
+    ...(results.alternatives.uncached === "all" ? {} : { uncached: results.alternatives.uncached }),
+    ...(results.alternatives.usenet === "all" ? {} : { usenet: results.alternatives.usenet }),
+    ...(results.alternatives.hideUncachedWhenCached ? { hideUncachedWhenCached: true } : {}),
+    ...(results.alternatives.direct === "always" ? {} : { direct: results.alternatives.direct }),
+    ...(results.alternatives.fallback ? { fallback: true } : {}),
+  };
+  const display =
+    results.display.preset === "custom"
+      ? {
+          preset: "custom" as const,
+          name: results.display.name ?? "",
+          description: results.display.description ?? "",
+        }
+      : results.display.preset === "default"
+        ? {}
+        : { preset: results.display.preset };
+  const auxiliary = {
+    ...(results.auxiliary.filterSummary === "whenEmpty"
+      ? {}
+      : { filterSummary: results.auxiliary.filterSummary }),
+    ...(results.auxiliary.errors === "bottom" ? {} : { errors: results.auxiliary.errors }),
+    ...(results.auxiliary.debridSync === "bottom"
+      ? {}
+      : { debridSync: results.auxiliary.debridSync }),
+  };
+  return {
+    ...(Object.keys(filters).length ? { filters } : {}),
+    ...(JSON.stringify(sort) ===
+    JSON.stringify(
+      DEFAULT_SORT.map(({ direction, key }) => ({
+        key,
+        ...(direction === "desc" ? {} : { direction }),
+      })),
+    )
+      ? {}
+      : { sort }),
+    ...(results.limits.some(({ max }) => max > 0)
+      ? { limits: results.limits.filter(({ max }) => max > 0) }
+      : {}),
+    ...(Object.keys(alternatives).length ? { alternatives } : {}),
+    ...(Object.keys(display).length ? { display } : {}),
+    ...(Object.keys(auxiliary).length ? { auxiliary } : {}),
+  } as NonNullable<ConfigModel["results"]>;
 }
 
 export function configurationDocument(
@@ -191,32 +536,25 @@ export function configurationDocument(
     (entry) => entry.service === DIRECT_TORRENT_SERVICE,
   );
   const common: ConfigModel = {
-    ...loaded,
-    cachedOnly: values.cachedOnly,
+    ...canonicalLoaded(loaded),
     debridStreamProxyPassword: values.proxyPassword,
     languages: {
-      allowed: values.allowedLanguages,
-      exclude: values.excludedLanguages,
-      preferred: values.preferredLanguages,
-      required: values.requiredLanguages,
+      ...(values.allowedLanguages.length ? { allowed: values.allowedLanguages } : {}),
+      ...(values.excludedLanguages.length ? { exclude: values.excludedLanguages } : {}),
+      ...(values.preferredLanguages.length ? { preferred: values.preferredLanguages } : {}),
+      ...(values.requiredLanguages.length ? { required: values.requiredLanguages } : {}),
+      ...(values.unknownLanguages === "exclude" ? { unknown: "exclude" as const } : {}),
     },
-    maxResultsPerResolution: values.maxResultsPerResolution,
-    maxSize: values.maxSizeGb * 1_073_741_824,
-    options: {
-      allow_english_in_languages: values.allowEnglishInLanguages,
-      remove_unknown_languages: values.removeUnknownLanguages,
-    },
-    removeTrash: values.removeTrash,
-    resolutions: Object.fromEntries(
-      bootstrap.resolutions
-        .filter((resolution) => !values.resolutions.includes(resolution))
-        .map((resolution) => [resolution, false]),
-    ),
-    resultFormat: compactResultFormat(values.resultFormat, bootstrap.result_formats),
+    results: compactResults(values.results),
     scrapeDebridAccountTorrents: values.scrapeDebridAccountTorrents,
   };
 
-  if (values.schemaVersion === 1 && values.bittorrentEnabled && !values.usenetEnabled) {
+  if (
+    values.schemaVersion === 1 &&
+    values.bittorrentEnabled &&
+    !values.usenetEnabled &&
+    !values.results.alternatives.fallback
+  ) {
     const document: MutableConfiguration = {
       ...common,
       debridServices: debridServices.map(({ apiKey, service }) => ({ apiKey, service })),
@@ -233,9 +571,7 @@ export function configurationDocument(
     return document;
   }
 
-  const accounts: Record<string, Record<string, unknown>> = {
-    ...(loaded?.accounts ?? {}),
-  };
+  const accounts: Record<string, Record<string, unknown>> = { ...(loaded?.accounts ?? {}) };
   const playbackProviders: PlaybackProviderEntry[] = debridServices.map((entry) => {
     const previous = loaded?.playbackProviders?.find(
       ({ configurationId }) => configurationId === entry.configurationId,
@@ -269,14 +605,12 @@ export function configurationDocument(
         !activePlaybackKinds.has(provider.kind),
     ),
   );
-  if (values.usenetEnabled) {
-    playbackProviders.push(...values.usenetProviders.map(bindingDocument));
-  }
+  if (values.usenetEnabled) playbackProviders.push(...values.usenetProviders.map(bindingDocument));
   const discoverySources = values.usenetEnabled ? values.usenetSources.map(bindingDocument) : [];
   const referencedAccounts = new Set(
     [...playbackProviders, ...discoverySources]
       .map((binding) => binding.accountId)
-      .filter((accountId): accountId is string => accountId !== null && accountId !== undefined),
+      .filter((accountId): accountId is string => accountId != null),
   );
   const nativeAccessToken =
     values.usenetEnabled &&
@@ -284,7 +618,6 @@ export function configurationDocument(
     values.usenetProviders.some(({ kind }) => kind === NATIVE_USENET_PROVIDER)
       ? values.nativeAccessToken
       : "";
-
   const document: MutableConfiguration = {
     ...common,
     accounts: Object.fromEntries(

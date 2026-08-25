@@ -1,86 +1,68 @@
-"""Transport-neutral RTN ranking for every release family."""
+"""RTN scoring without result-policy, limit, or presentation responsibilities."""
+
+from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 
-from RTN import ParsedData, check_fetch_and_rank_many
-from RTN.extras import RESOLUTION_MAP, Resolution
+from RTN import check_fetch_and_rank_many
 
 from comet.core.sources import ReleaseCandidate
+from comet.results.facts import ReleaseFacts
 
 
-def _resolution_key(parsed: ParsedData) -> Resolution:
-    return RESOLUTION_MAP.get(parsed.resolution.lower(), Resolution.UNKNOWN)
-
-
-def rank_release_records(
+def score_release_records(
     records: Mapping[str, Mapping[str, object]],
     rtn_settings,
     rtn_ranking,
-    max_results_per_resolution: int,
-    max_size: int,
-    remove_trash: int,
-) -> list[str]:
-    """Apply RTN rank/filter rules without constructing torrent identifiers."""
-    eligible = []
-    for record_id, record in records.items():
-        size = record["size"]
-        if max_size and size is not None and size > max_size:
-            continue
-        parsed = record["parsed"]
-        if parsed is not None:
-            eligible.append((record_id, parsed))
-
-    rank_results = check_fetch_and_rank_many(
+) -> dict[str, float]:
+    """Return raw RTN scores for already normalized releases."""
+    eligible = [
+        (record_id, record["parsed"])
+        for record_id, record in records.items()
+        if record.get("parsed") is not None
+    ]
+    results = check_fetch_and_rank_many(
         (parsed for _record_id, parsed in eligible),
         rtn_settings,
         rtn_ranking,
     )
-    ranked = []
-    for (record_id, parsed), (is_fetchable, _reasons, rank) in zip(
-        eligible, rank_results
-    ):
-        if remove_trash and not is_fetchable:
-            continue
-        ranked.append((_resolution_key(parsed), rank, record_id))
-
-    ranked.sort(key=lambda item: (item[0].value, item[1], item[2]), reverse=True)
-    if max_results_per_resolution <= 0:
-        return [record_id for _resolution, _rank, record_id in ranked]
-
-    selected = []
-    per_resolution = {}
-    for resolution, _rank, record_id in ranked:
-        count = per_resolution.get(resolution, 0)
-        if count >= max_results_per_resolution:
-            continue
-        per_resolution[resolution] = count + 1
-        selected.append(record_id)
-    return selected
+    return {
+        record_id: rank
+        for (record_id, _parsed), (_is_fetchable, _reasons, rank) in zip(
+            eligible, results
+        )
+    }
 
 
-def sort_candidates(
+@dataclass(frozen=True, slots=True)
+class ScoredRelease:
+    candidate: ReleaseCandidate
+    facts: ReleaseFacts
+    rank: float
+
+
+def score_candidates(
     candidates: Iterable[ReleaseCandidate],
+    facts: Mapping[str, ReleaseFacts],
     rtn_settings,
     rtn_ranking,
-    max_results_per_resolution: int,
-    max_size: int,
-    remove_trash: int,
-) -> tuple[ReleaseCandidate, ...]:
-    """Rank one mixed transport-neutral batch with deterministic candidate ties."""
+) -> tuple[ScoredRelease, ...]:
     ordered = tuple(candidates)
-    by_id = {candidate.candidate_id: candidate for candidate in ordered}
-    ranked_ids = rank_release_records(
-        {
-            candidate.candidate_id: {
-                "parsed": candidate.parsed,
-                "size": candidate.size,
-            }
-            for candidate in ordered
-        },
+    scores = score_release_records(
+        {candidate.candidate_id: {"parsed": candidate.parsed} for candidate in ordered},
         rtn_settings,
         rtn_ranking,
-        max_results_per_resolution,
-        max_size,
-        remove_trash,
     )
-    return tuple(by_id[candidate_id] for candidate_id in ranked_ids)
+    return tuple(
+        ScoredRelease(
+            candidate,
+            facts[candidate.candidate_id],
+            scores[candidate.candidate_id],
+        )
+        for candidate in sorted(
+            ordered,
+            key=lambda item: (-scores[item.candidate_id], item.candidate_id),
+        )
+        if candidate.candidate_id in scores
+    )

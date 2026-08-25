@@ -1,42 +1,35 @@
 import { describe, expect, it } from "vitest";
-import type { ConfigModel, ConfiguratorBootstrapData } from "../../api/generated/contracts";
+import type { ConfigModel } from "../../api/generated/contracts";
 import { decodeConfiguration, encodeConfiguration, manifestLocation } from "./codec";
 import { configurationDocument, DIRECT_TORRENT_SERVICE, formValues } from "./model";
+import { bootstrapFixture } from "./testing";
 
-const bootstrap = {
-  capabilities: {
-    native_usenet: true,
-    proxy_debrid_stream: true,
-    stremio_api_prefix: "",
-    torrent_streams: true,
-    usenet: true,
-  },
+const bootstrap = bootstrapFixture({
+  capabilities: { native_usenet: true, proxy_debrid_stream: true, usenet: true },
   debrid_services: ["realdebrid", "torbox"],
   default_configuration: {
-    cachedOnly: false,
     debridServices: [],
     debridStreamProxyPassword: "",
     enableTorrent: true,
-    languages: { allowed: [], exclude: [], preferred: [], required: [] },
-    maxResultsPerResolution: 0,
-    maxSize: 0,
-    options: {
-      allow_english_in_languages: false,
-      remove_unknown_languages: false,
-    },
-    removeTrash: true,
-    resolutions: {},
-    resultFormat: ["all"],
+    languages: { allowed: [], exclude: [], preferred: [], required: [], unknown: "allow" },
+    results: {},
     schemaVersion: 1,
     scrapeDebridAccountTorrents: false,
   },
-  languages: { en: "🇬🇧", fr: "🇫🇷" },
+  languages: { en: "\u{1F1EC}\u{1F1E7}", fr: "\u{1F1EB}\u{1F1F7}" },
   native_usenet_sources: ["instance_pool", "personal_servers"],
-  resolutions: ["r2160p", "r1080p", "unknown"],
-  result_formats: ["title", "size"],
+  result_fields: ["title", "size"],
+  result_scopes: ["all", "needsDownload"],
+  result_sort_keys: ["resolution", "cached", "language", "rank", "provider"],
+  result_sort_presets: {
+    smart: [
+      { key: "resolution", direction: "desc" },
+      { key: "cached", direction: "desc" },
+    ],
+  },
   usenet_provider_kinds: ["torbox_usenet", "comet_native_usenet"],
   usenet_source_kinds: ["newznab"],
-} as ConfiguratorBootstrapData;
+});
 
 describe("configuration codec", () => {
   it("round trips URL-safe UTF-8 documents without padding", () => {
@@ -95,7 +88,10 @@ describe("configuration codec", () => {
           options: {},
         },
       ],
-      resultFormat: ["title", "video_info", "audio_info", "size"],
+      results: {
+        display: { preset: "technical" },
+        sort: [{ key: "cached", direction: "desc" }],
+      },
       schemaVersion: 2,
     } satisfies ConfigModel;
     const legacyLength = Math.ceil(
@@ -104,7 +100,7 @@ describe("configuration codec", () => {
 
     const { encoded } = encodeConfiguration(configuration);
 
-    expect(encoded).toMatch(/^z1\.[A-Za-z0-9_-]+$/);
+    expect(encoded).toMatch(/^z[12]\.[A-Za-z0-9_-]+$/);
     expect(encoded.length).toBeLessThan(legacyLength * 0.45);
     expect(decodeConfiguration(encoded)).toEqual(configuration);
   });
@@ -114,12 +110,103 @@ describe("configuration codec", () => {
 
     expect(manifestLocation(undefined, "", false).url).toBe("http://localhost/manifest.json");
     expect(manifestLocation(configuration, "", true).url).toMatch(
-      /^stremio:\/\/localhost\/z1\.[A-Za-z0-9_-]+\/manifest\.json$/,
+      /^stremio:\/\/localhost\/z[12]\.[A-Za-z0-9_-]+\/manifest\.json$/,
     );
   });
 });
 
 describe("configuration form mapping", () => {
+  it("fills a partial results document from canonical defaults and emits it compactly", () => {
+    const values = formValues({ results: { display: { preset: "compact" } } }, bootstrap);
+
+    expect(values.results.sort.map(({ key }) => key)).toEqual([
+      "resolution",
+      "cached",
+      "language",
+      "rank",
+      "provider",
+    ]);
+    expect(configurationDocument(values, bootstrap).results).toEqual({
+      display: { preset: "compact" },
+    });
+  });
+
+  it("preserves every non-default results family through form mapping", () => {
+    const source = {
+      results: {
+        alternatives: {
+          cached: "best",
+          direct: "unlessCached",
+          fallback: true,
+          hideUncachedWhenCached: true,
+          uncached: "best",
+          usenet: "best",
+        },
+        auxiliary: { debridSync: "off", errors: "top", filterSummary: "bottom" },
+        display: { description: "{title}", name: "{provider.name}", preset: "custom" },
+        filters: {
+          dimensions: { quality: { exclude: ["cam"], only: ["webdl"] } },
+          keywords: {
+            prefer: [{ mode: "word", target: "releaseGroup", value: "GROUP" }],
+          },
+          ranges: { seeders: { min: 3, scope: "needsDownload" } },
+          removeTrash: false,
+          rules: [
+            {
+              action: "require",
+              all: [{ field: "seeders", op: "gte", value: 5 }],
+              id: "enough-seeders",
+            },
+          ],
+        },
+        limits: [{ by: "quality", max: 5 }],
+        sort: [
+          {
+            direction: "asc",
+            key: "quality",
+            order: ["webdl", "bluray"],
+            scope: "torrent",
+          },
+        ],
+      },
+    } satisfies ConfigModel;
+
+    const rebuilt = configurationDocument(formValues(source, bootstrap), bootstrap);
+
+    expect(rebuilt.results).toMatchObject(source.results);
+  });
+
+  it("upgrades a v1 form to v2 when server fallback is enabled", () => {
+    const values = formValues(bootstrap.default_configuration, bootstrap);
+    values.results.alternatives.fallback = true;
+
+    const rebuilt = configurationDocument(values, bootstrap);
+
+    expect(rebuilt.schemaVersion).toBe(2);
+    expect(rebuilt.results?.alternatives?.fallback).toBe(true);
+    expect(rebuilt.playbackProviders?.some(({ kind }) => kind === "direct_torrent")).toBe(true);
+  });
+
+  it("emits only the canonical results and language roots", () => {
+    const loaded = {
+      cachedOnly: true,
+      maxResultsPerResolution: 5,
+      options: { allow_english_in_languages: true },
+      resultFormat: ["title"],
+      results: { display: { preset: "compact" } },
+      schemaVersion: 1,
+    } as unknown as ConfigModel;
+    const rebuilt = configurationDocument(formValues(loaded, bootstrap), bootstrap, loaded);
+    const document = rebuilt as unknown as Record<string, unknown>;
+
+    expect(rebuilt.results?.display?.preset).toBe("compact");
+    expect(rebuilt.languages?.unknown).toBeUndefined();
+    expect(document.cachedOnly).toBeUndefined();
+    expect(document.maxResultsPerResolution).toBeUndefined();
+    expect(document.options).toBeUndefined();
+    expect(document.resultFormat).toBeUndefined();
+  });
+
   it("preserves v2 identifiers, linked accounts, disabled entries and unknown kinds", () => {
     const loaded = {
       accounts: {

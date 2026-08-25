@@ -122,9 +122,12 @@ def generate() -> str:
     from comet.api.app import fastapi_app
     from comet.core.config_codec import (
         CONFIGURATION_DICTIONARY_V1,
+        CONFIGURATION_DICTIONARY_V2,
         MAX_CONFIG_JSON_BYTES,
         MAX_CONFIG_SEGMENT_BYTES,
     )
+    from comet.results.config import result_enum_identifiers
+    from comet.results.formatting import FIELD_REGISTRY
 
     document = fastapi_app.openapi()
     paths = {
@@ -149,8 +152,23 @@ def generate() -> str:
         "export const CONFIGURATION_DICTIONARY_V1 = "
         + json.dumps(CONFIGURATION_DICTIONARY_V1.decode("ascii"))
         + ";",
+        "export const CONFIGURATION_DICTIONARY_V2 = "
+        + json.dumps(CONFIGURATION_DICTIONARY_V2.decode("ascii"))
+        + ";",
         f"export const MAX_CONFIG_JSON_BYTES = {MAX_CONFIG_JSON_BYTES};",
         f"export const MAX_CONFIG_SEGMENT_BYTES = {MAX_CONFIG_SEGMENT_BYTES};",
+        "export const RESULT_FIELD_IDS = "
+        + json.dumps(
+            [
+                identifier
+                for identifier, definition in FIELD_REGISTRY.items()
+                if definition.public
+            ]
+        )
+        + " as const;",
+        "export const RESULT_ENUM_IDS = "
+        + json.dumps(list(result_enum_identifiers()))
+        + " as const;",
         "",
     ]
     for name in sorted(referenced):

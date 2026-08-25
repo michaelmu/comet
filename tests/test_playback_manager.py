@@ -42,6 +42,7 @@ from comet.playback.manager import (
     prepare_nzbdav,
     prepare_stremthru_newz,
     prepare_torbox_usenet,
+    resolve_fallback_playback_intent,
     resolve_nzb_handoff_intent,
     resolve_playback_intent,
     resolve_prepared_asset,
@@ -216,6 +217,115 @@ def _stremthru_pending_prepared(provider):
 
 
 class PlaybackManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fallback_resolves_only_current_attempt_and_rechecks_transport(self):
+        candidate_id = uuid.uuid4()
+        provider_ids = (uuid.uuid4(), uuid.uuid4())
+        locator_ids = (uuid.uuid4(), uuid.uuid4())
+        config = {
+            "schemaVersion": 2,
+            "enabledTransports": ["usenet"],
+            "playbackProviders": [
+                {
+                    "configurationId": str(provider_id),
+                    "kind": kind,
+                    "enabled": True,
+                }
+                for provider_id, kind in zip(provider_ids, ("torbox_usenet", "nzbdav"))
+            ],
+        }
+        codec = CapabilityCodec(ROOT)
+        partition = codec.configuration_partition_for_config(config)
+        token = codec.encode(
+            "pf2",
+            partition=partition,
+            suffix=[
+                candidate_id.bytes,
+                "usenet",
+                [
+                    [provider_id.bytes, [locator_id.bytes]]
+                    for provider_id, locator_id in zip(provider_ids, locator_ids)
+                ],
+                [0],
+                "stremio",
+            ],
+            ttl=60,
+        )
+        resolution = type(
+            "Resolution",
+            (),
+            {"release": type("Release", (), {"transport": "usenet"})()},
+        )()
+        resolver = AsyncMock(return_value=resolution)
+        with (
+            patch("comet.playback.manager.settings.COMET_CAPABILITY_SECRET", ROOT),
+            patch("comet.playback.manager._resolve_decoded_intent", resolver),
+        ):
+            resolved, fallback = await resolve_fallback_playback_intent(
+                token, config, object(), object()
+            )
+
+        self.assertIs(resolved, resolution)
+        self.assertEqual(resolver.await_count, 1)
+        current = resolver.await_args.args[0]
+        self.assertEqual(current.provider_configuration_id, str(provider_ids[0]))
+        self.assertEqual(current.locator_ids, (str(locator_ids[0]),))
+        self.assertEqual(len(fallback.options), 2)
+
+        wrong_transport = type(
+            "Resolution",
+            (),
+            {"release": type("Release", (), {"transport": "bittorrent"})()},
+        )()
+        with (
+            patch("comet.playback.manager.settings.COMET_CAPABILITY_SECRET", ROOT),
+            patch(
+                "comet.playback.manager._resolve_decoded_intent",
+                AsyncMock(return_value=wrong_transport),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "fallback transport"):
+                await resolve_fallback_playback_intent(
+                    token, config, object(), object()
+                )
+
+    async def test_fallback_rejects_direct_provider_before_resolution(self):
+        candidate_id, direct_id, cloud_id, locator_id = (uuid.uuid4() for _ in range(4))
+        config = {
+            "schemaVersion": 2,
+            "enabledTransports": ["bittorrent"],
+            "playbackProviders": [
+                {"configurationId": str(direct_id), "kind": "direct_torrent"},
+                {"configurationId": str(cloud_id), "kind": "torbox"},
+            ],
+        }
+        codec = CapabilityCodec(ROOT)
+        partition = codec.configuration_partition_for_config(config)
+        token = codec.encode(
+            "pf2",
+            partition=partition,
+            suffix=[
+                candidate_id.bytes,
+                "bittorrent",
+                [
+                    [direct_id.bytes, [locator_id.bytes]],
+                    [cloud_id.bytes, [locator_id.bytes]],
+                ],
+                [0],
+                "stremio",
+            ],
+            ttl=60,
+        )
+        resolver = AsyncMock()
+        with (
+            patch("comet.playback.manager.settings.COMET_CAPABILITY_SECRET", ROOT),
+            patch("comet.playback.manager._resolve_decoded_intent", resolver),
+        ):
+            with self.assertRaisesRegex(ValueError, "fallback provider"):
+                await resolve_fallback_playback_intent(
+                    token, config, object(), object()
+                )
+        resolver.assert_not_awaited()
+
     async def test_publication_operation_allows_an_explicit_reuse_only_result(self):
         preparation_id = str(uuid.uuid4())
         prepared = type(

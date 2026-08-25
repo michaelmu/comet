@@ -25,9 +25,22 @@ from comet.api.endpoints.torznab import (
     serialize_feed,
     torznab_api,
 )
+from comet.core.capabilities import EligibleProvider
 from comet.core.models import settings
+from comet.core.sources import (
+    LocatorKind,
+    LocatorPolicy,
+    ReleaseCandidate,
+    ReleaseScope,
+    TorrentLocator,
+    TransportKind,
+)
 from comet.metadata import imdb as imdb_metadata
 from comet.metadata.imdb import resolve_imdb_title
+from comet.playback.presentation import ProviderOption
+from comet.results.facts import extract_release_facts, result_entry
+from comet.results.ordering import SelectionCounts
+from comet.results.pipeline import PipelineResult
 from comet.services.media_search import MediaSearchResult, MediaSearchStatus
 
 
@@ -72,15 +85,74 @@ def _torrent(index: int, *, title: str | None = None, seeders: int = 0) -> dict:
 
 def _result(count: int, *, media_type: str = "movie") -> MediaSearchResult:
     hashes = [f"{index:040x}" for index in range(count)]
+    torrents = {info_hash: _torrent(index) for index, info_hash in enumerate(hashes)}
+    candidates = tuple(
+        ReleaseCandidate(
+            candidate_id=f"btih:{info_hash}",
+            media_id="tt1234567",
+            scope=(
+                ReleaseScope.MOVIE if media_type == "movie" else ReleaseScope.EPISODE
+            ),
+            transport=TransportKind.BITTORRENT,
+            title=torrents[info_hash]["title"],
+            locators=(
+                TorrentLocator(
+                    locator_id=f"torrent:{info_hash}",
+                    kind=LocatorKind.TORRENT,
+                    policy=LocatorPolicy(frozenset({"direct_torrent"})),
+                    info_hash=info_hash,
+                ),
+            ),
+            size=torrents[info_hash]["size"],
+            source=torrents[info_hash]["tracker"],
+            parsed=torrents[info_hash]["parsed"],
+            transport_stats={"seeders": torrents[info_hash]["seeders"]},
+        )
+        for info_hash in hashes
+    )
+    provider = EligibleProvider("direct", "direct_torrent", 0)
+    options = tuple(
+        ProviderOption(candidate.candidate_id, provider, candidate.locators)
+        for candidate in candidates
+    )
+    entries = tuple(
+        result_entry(
+            candidate,
+            option,
+            extract_release_facts(candidate),
+            count - position,
+            provider_name="Direct",
+            release_position=position,
+        )
+        for position, (candidate, option) in enumerate(zip(candidates, options))
+    )
+    pipeline = PipelineResult(
+        candidates,
+        options,
+        entries,
+        count,
+        (),
+        SelectionCounts(),
+    )
     return MediaSearchResult(
         MediaSearchStatus.OK,
         metadata={"title": "Movie", "year": 2024},
-        torrents={info_hash: _torrent(index) for index, info_hash in enumerate(hashes)},
-        ranked_info_hashes=hashes,
+        torrents=torrents,
         media_only_id="tt1234567",
         search_season=0 if media_type == "series" else None,
         search_episode=2 if media_type == "series" else None,
+        candidates=candidates,
+        provider_options=options,
+        pipeline=pipeline,
     )
+
+
+def _result_hashes(result: MediaSearchResult) -> list[str]:
+    return [
+        entry.facts.candidate_id.removeprefix("btih:")
+        for entry in result.pipeline.entries
+        if entry.facts.candidate_id.startswith("btih:")
+    ]
 
 
 class _Content:
@@ -430,7 +502,7 @@ class TorznabPureTests(unittest.IsolatedAsyncioTestCase):
 
     def test_xml_serialization_sanitizes_and_emits_required_fields(self):
         result = _result(1)
-        info_hash = result.ranked_info_hashes[0]
+        info_hash = _result_hashes(result)[0]
         result.torrents[info_hash] = _torrent(0, title="A & B < C\x00 😀", seeders=0)
 
         content, total = serialize_feed(
@@ -478,7 +550,7 @@ class TorznabPureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(total, 205)
         self.assertEqual(response.attrib, {"offset": "0", "total": "205"})
-        self.assertEqual(hashes, result.ranked_info_hashes)
+        self.assertEqual(hashes, _result_hashes(result))
 
 
 class TorznabRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -703,7 +775,7 @@ class TorznabRouteTests(unittest.IsolatedAsyncioTestCase):
         payload = orjson.loads(response.body)
         self.assertEqual(
             [stream["infoHash"] for stream in payload["streams"]],
-            result.ranked_info_hashes,
+            _result_hashes(result),
         )
 
 
