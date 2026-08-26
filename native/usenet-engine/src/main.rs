@@ -3852,7 +3852,7 @@ fn runtime_stats_body(state: &EngineState) -> String {
         .raw_composites
         .lock()
         .expect("raw composite registry lock")
-        .len();
+        .len(now);
     let provider_sets = state
         .provider_sets
         .lock()
@@ -3899,7 +3899,7 @@ fn runtime_stats_body(state: &EngineState) -> String {
             .negative_cache
             .lock()
             .expect("negative cache lock")
-            .len(),
+            .len(now),
         network_singleflight_active: state.network_singleflight.active(),
         nntp_pools: pool_stats.pools,
         nntp_connections_open: pool_stats.open,
@@ -9731,7 +9731,7 @@ mod request_tests {
                 .raw_composites
                 .lock()
                 .expect("raw composite registry")
-                .len(),
+                .len(std::time::Instant::now()),
             1
         );
         assert_eq!(
@@ -9827,7 +9827,7 @@ mod request_tests {
                 .raw_composites
                 .lock()
                 .expect("raw composite registry")
-                .len(),
+                .len(std::time::Instant::now()),
             0
         );
 
@@ -10168,7 +10168,7 @@ mod request_tests {
                 .raw_composites
                 .lock()
                 .expect("immutable source registry")
-                .len(),
+                .len(std::time::Instant::now()),
             1
         );
 

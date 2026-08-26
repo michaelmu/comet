@@ -576,7 +576,8 @@ impl RawCompositeRegistry {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&mut self, now: Instant) -> usize {
+        self.remove_expired(now);
         self.entries.len()
     }
 
@@ -849,8 +850,8 @@ mod tests {
             .expect("remove idle composite");
         registry.insert(source(), now).expect("reinsert composite");
         let later = now + Duration::from_secs(6 * 60 * 60);
+        assert_eq!(registry.len(later), 0);
         assert!(registry.get(&"f".repeat(64), later).is_err());
-        assert_eq!(registry.len(), 0);
     }
 
     #[test]

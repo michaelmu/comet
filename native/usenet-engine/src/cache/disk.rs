@@ -335,65 +335,8 @@ impl DiskSegmentCache {
         let mut used = used_bytes(&transaction)?;
         if used > self.budget {
             let target = self.budget / 10 * 9 + self.budget % 10 * 9 / 10;
-            while used > target {
-                let candidates = transaction
-                    .prepare(
-                        "
-                        SELECT m.acquisition_key, m.digest, b.allocated_bytes,
-                               (
-                                   SELECT count(*)
-                                   FROM acquisition_mappings r
-                                   WHERE r.digest = m.digest
-                               )
-                        FROM acquisition_mappings m
-                        JOIN blobs b USING (digest)
-                        WHERE m.acquisition_key != ?1
-                        ORDER BY m.last_access_ms, m.acquisition_key
-                        LIMIT ?2
-                        ",
-                    )
-                    .and_then(|mut statement| {
-                        statement
-                            .query_map(params![key.0.as_slice(), EVICTION_BATCH_SIZE], |row| {
-                                Ok((
-                                    fixed_digest(row.get_ref(0)?.as_blob()?)?,
-                                    fixed_digest(row.get_ref(1)?.as_blob()?)?,
-                                    to_u64_sql(row.get(2)?)?,
-                                    to_u64_sql(row.get(3)?)?,
-                                ))
-                            })?
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .map_err(|_| "disk_cache_unavailable")?;
-                if candidates.is_empty() {
-                    break;
-                }
-                let mut projected = used;
-                let mut removed_references = HashMap::with_capacity(candidates.len());
-                let mut victim_count = 0;
-                for (_, digest, allocated_bytes, references) in &candidates {
-                    projected -= DISK_MAPPING_OVERHEAD_BYTES;
-                    let removed = removed_references.entry(*digest).or_insert(0);
-                    *removed += 1;
-                    if *removed == *references {
-                        projected -= allocated_bytes;
-                    }
-                    victim_count += 1;
-                    if projected <= target {
-                        break;
-                    }
-                }
-                for (victim, _, _, _) in candidates.iter().take(victim_count) {
-                    transaction
-                        .execute(
-                            "DELETE FROM acquisition_mappings WHERE acquisition_key = ?1",
-                            params![victim.as_slice()],
-                        )
-                        .map_err(|_| "disk_cache_unavailable")?;
-                }
-                evicted.extend(remove_unreferenced_blobs(&transaction)?);
-                used = used_bytes(&transaction)?;
-            }
+            evicted.extend(evict_to_target(&transaction, target, Some(key))?);
+            used = used_bytes(&transaction)?;
             if used > self.budget {
                 return Err("disk_cache_capacity_unavailable");
             }
@@ -541,6 +484,20 @@ impl DiskSegmentCache {
                     .map_err(|_| "disk_cache_unavailable")?;
             }
         }
+        drop(indexed_blob);
+        let used = used_bytes(&self.connection)?;
+        if used > self.budget {
+            let target = self.budget / 10 * 9 + self.budget % 10 * 9 / 10;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| "disk_cache_unavailable")?;
+            let evicted = evict_to_target(&transaction, target, None)?;
+            transaction.commit().map_err(|_| "disk_cache_unavailable")?;
+            for digest in evicted {
+                self.remove_blob(digest)?;
+            }
+        }
         self.blobs_directory
             .sync()
             .map_err(|_| "disk_cache_unavailable")
@@ -608,6 +565,76 @@ fn used_bytes(connection: &Connection) -> Result<u64, &'static str> {
             |row| to_u64_sql(row.get(0)?),
         )
         .map_err(|_| "disk_cache_unavailable")
+}
+
+fn evict_to_target(
+    connection: &Connection,
+    target: u64,
+    protected: Option<SegmentCacheKey>,
+) -> Result<Vec<[u8; 32]>, &'static str> {
+    let protected = protected.map(|key| key.0.to_vec());
+    let mut evicted = Vec::new();
+    let mut used = used_bytes(connection)?;
+    while used > target {
+        let candidates = connection
+            .prepare(
+                "
+                SELECT m.acquisition_key, m.digest, b.allocated_bytes,
+                       (
+                           SELECT count(*)
+                           FROM acquisition_mappings r
+                           WHERE r.digest = m.digest
+                       )
+                FROM acquisition_mappings m
+                JOIN blobs b USING (digest)
+                WHERE (?1 IS NULL OR m.acquisition_key != ?1)
+                ORDER BY m.last_access_ms, m.acquisition_key
+                LIMIT ?2
+                ",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![protected, EVICTION_BATCH_SIZE], |row| {
+                        Ok((
+                            fixed_digest(row.get_ref(0)?.as_blob()?)?,
+                            fixed_digest(row.get_ref(1)?.as_blob()?)?,
+                            to_u64_sql(row.get(2)?)?,
+                            to_u64_sql(row.get(3)?)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|_| "disk_cache_unavailable")?;
+        if candidates.is_empty() {
+            break;
+        }
+        let mut projected = used;
+        let mut removed_references = HashMap::with_capacity(candidates.len());
+        let mut victim_count = 0;
+        for (_, digest, allocated_bytes, references) in &candidates {
+            projected -= DISK_MAPPING_OVERHEAD_BYTES;
+            let removed = removed_references.entry(*digest).or_insert(0);
+            *removed += 1;
+            if *removed == *references {
+                projected -= allocated_bytes;
+            }
+            victim_count += 1;
+            if projected <= target {
+                break;
+            }
+        }
+        for (victim, _, _, _) in candidates.iter().take(victim_count) {
+            connection
+                .execute(
+                    "DELETE FROM acquisition_mappings WHERE acquisition_key = ?1",
+                    params![victim.as_slice()],
+                )
+                .map_err(|_| "disk_cache_unavailable")?;
+        }
+        evicted.extend(remove_unreferenced_blobs(connection)?);
+        used = used_bytes(connection)?;
+    }
+    Ok(evicted)
 }
 
 fn remove_unreferenced_blobs(connection: &Connection) -> Result<Vec<[u8; 32]>, &'static str> {
@@ -867,6 +894,23 @@ mod tests {
         let mut cache = DiskSegmentCache::open(&root, 32 * 1024, 0).unwrap();
         assert_eq!(cache.get(key(1)).unwrap().unwrap().to_decoded().bytes[0], 7);
         assert_eq!(cache.stats().unwrap().mappings, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reopen_enforces_a_reduced_disk_budget() {
+        let root = root("reduced-budget");
+        {
+            let mut cache = DiskSegmentCache::open(&root, 128 * 1024, 0).unwrap();
+            for value in 1..=32 {
+                cache.insert(key(value), &segment(value, 1024)).unwrap();
+            }
+            assert!(cache.stats().unwrap().used_bytes > 16 * 1024);
+        }
+
+        let cache = DiskSegmentCache::open(&root, 16 * 1024, 0).unwrap();
+
+        assert!(cache.stats().unwrap().used_bytes <= 16 * 1024 * 9 / 10);
         let _ = std::fs::remove_dir_all(root);
     }
 

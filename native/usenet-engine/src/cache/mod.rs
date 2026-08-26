@@ -540,7 +540,8 @@ impl NegativeSegmentCache {
         self.compact_auxiliary_indexes();
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&mut self, now: Instant) -> usize {
+        self.prune(now);
         self.records.len()
     }
 
@@ -821,7 +822,7 @@ mod tests {
         assert_eq!(cache.get(key(2), now), Some(NegativeKind::Corrupt));
 
         cache.insert(key(3), NegativeKind::Missing, now);
-        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.len(now), 2);
         assert_eq!(cache.get(key(1), now), None);
         assert_eq!(cache.get(key(2), now + Duration::from_secs(5 * 60)), None);
         assert_eq!(
@@ -854,8 +855,19 @@ mod tests {
             cache.record_success(cache_key);
         }
 
-        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.len(now), 0);
         assert!(cache.order.len() <= 4);
         assert!(cache.expirations.len() <= 4);
+    }
+
+    #[test]
+    fn observing_negative_cache_size_prunes_expired_entries() {
+        let now = Instant::now();
+        let mut cache = NegativeSegmentCache::new(2);
+        cache.insert(key(1), NegativeKind::Missing, now);
+        cache.insert(key(2), NegativeKind::Corrupt, now);
+
+        assert_eq!(cache.len(now + Duration::from_secs(5 * 60)), 1);
+        assert_eq!(cache.len(now + Duration::from_secs(10 * 60)), 0);
     }
 }
