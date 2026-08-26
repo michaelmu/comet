@@ -152,6 +152,31 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(called.is_set())
         self.assertEqual(result["outcome"], "succeeded")
 
+    async def test_command_polling_does_not_write_a_runtime_row_each_poll(self):
+        runtime_writes = 0
+        original_execute = self.database.execute
+
+        async def tracked_execute(query, *args, **kwargs):
+            nonlocal runtime_writes
+            if "INSERT INTO background_scraper_runtimes" in str(query):
+                runtime_writes += 1
+            return await original_execute(query, *args, **kwargs)
+
+        with (
+            patch.object(commands, "_POLL_INTERVAL_SECONDS", 0.005),
+            patch.object(commands, "_RUNTIME_HEARTBEAT_INTERVAL_SECONDS", 0.03),
+            patch.object(self.database, "execute", tracked_execute),
+        ):
+            dispatcher = asyncio.create_task(commands.run_command_dispatcher())
+            try:
+                await asyncio.sleep(0.08)
+            finally:
+                dispatcher.cancel()
+                await asyncio.gather(dispatcher, return_exceptions=True)
+
+        self.assertGreaterEqual(runtime_writes, 2)
+        self.assertLessEqual(runtime_writes, 4)
+
     async def test_runtime_restart_uses_an_interrupt_only_for_its_own_process(self):
         with (
             patch.object(commands.asyncio, "sleep", new=AsyncMock()),

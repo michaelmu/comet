@@ -89,6 +89,24 @@ class BandwidthMonitorTests(unittest.IsolatedAsyncioTestCase):
             "cancelled",
         )
 
+    async def test_idle_sync_does_not_query_or_write_connection_state(self):
+        monitor = BandwidthMonitor()
+
+        with (
+            patch(
+                "comet.services.bandwidth.database.execute_many",
+                new=AsyncMock(),
+            ) as execute_many,
+            patch(
+                "comet.services.bandwidth.database.fetch_all",
+                new=AsyncMock(),
+            ) as fetch_all,
+        ):
+            await monitor._sync_connections(time.time())
+
+        execute_many.assert_not_awaited()
+        fetch_all.assert_not_awaited()
+
     async def test_worker_deltas_accumulate_atomically(self):
         with TemporaryDirectory() as temp_dir:
             database = ReplicaAwareDatabase(

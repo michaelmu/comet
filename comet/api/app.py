@@ -56,6 +56,7 @@ from comet.cometnet.manager import init_cometnet_service
 from comet.cometnet.relay import init_relay, stop_relay
 from comet.core.capability_states import shutdown_capability_refreshes
 from comet.core.database import (
+    cleanup_expired_database_state,
     cleanup_expired_kodi_setup_codes,
     cleanup_expired_locks,
     cleanup_expired_usenet_state,
@@ -386,6 +387,12 @@ async def _lifespan_resources(app: FastAPI):
             name="database.cleanup_kodi",
         )
         cleanup.push_async_callback(_cancel_task, cleanup_kodi_task)
+        if settings.DATABASE_STARTUP_CLEANUP_INTERVAL > 0:
+            cleanup_database_task = create_detached_task(
+                cleanup_expired_database_state(),
+                name="database.cleanup_retention",
+            )
+            cleanup.push_async_callback(_cancel_task, cleanup_database_task)
         if settings.USENET_ENABLED:
             cleanup_usenet_task = create_detached_task(
                 cleanup_expired_usenet_state(),

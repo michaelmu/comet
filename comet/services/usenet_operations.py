@@ -236,26 +236,28 @@ class UsenetOperationMonitor:
 
     async def _sync_operations(self) -> None:
         operations = tuple(self._operations.values())
-        if operations:
-            synced_at = time.time()
-            for operation in operations:
-                operation.updated_at = synced_at
-            await database.execute_many(
-                """
-                UPDATE usenet_active_operations
-                SET updated_at = :updated_at,
-                    bytes_transferred = :bytes_transferred
-                WHERE id = :id
-                """,
-                [
-                    {
-                        "id": operation.id,
-                        "updated_at": operation.updated_at,
-                        "bytes_transferred": operation.bytes_transferred,
-                    }
-                    for operation in operations
-                ],
-            )
+        if not operations:
+            return
+
+        synced_at = time.time()
+        for operation in operations:
+            operation.updated_at = synced_at
+        await database.execute_many(
+            """
+            UPDATE usenet_active_operations
+            SET updated_at = :updated_at,
+                bytes_transferred = :bytes_transferred
+            WHERE id = :id
+            """,
+            [
+                {
+                    "id": operation.id,
+                    "updated_at": operation.updated_at,
+                    "bytes_transferred": operation.bytes_transferred,
+                }
+                for operation in operations
+            ],
+        )
         requested = await database.fetch_all(
             """
             SELECT id

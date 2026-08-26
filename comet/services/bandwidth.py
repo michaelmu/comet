@@ -202,20 +202,21 @@ class BandwidthMonitor:
                 }
                 for connection in connections
             ]
-        if values:
-            await database.execute_many(
-                """
-                UPDATE active_connections
-                SET updated_at = :updated_at,
-                    bytes_transferred = :bytes_transferred,
-                    current_speed = :current_speed,
-                    peak_speed = :peak_speed
-                WHERE id = :id
-                  AND instance_id = :instance_id
-                  AND process_id = :process_id
-                """,
-                values,
-            )
+        if not values:
+            return
+        await database.execute_many(
+            """
+            UPDATE active_connections
+            SET updated_at = :updated_at,
+                bytes_transferred = :bytes_transferred,
+                current_speed = :current_speed,
+                peak_speed = :peak_speed
+            WHERE id = :id
+              AND instance_id = :instance_id
+              AND process_id = :process_id
+            """,
+            values,
+        )
         requested = await database.fetch_all(
             """
             SELECT id
@@ -275,27 +276,28 @@ class BandwidthMonitor:
                         connection.current_speed
                         for connection in self._connections.values()
                     )
-                await database.execute(
-                    """
-                    INSERT INTO proxy_traffic_samples (
-                        instance_id, process_id, sampled_at,
-                        active_connections, current_speed
-                    ) VALUES (
-                        :instance_id, :process_id, :sampled_at,
-                        :active_connections, :current_speed
+                if active_connections:
+                    await database.execute(
+                        """
+                        INSERT INTO proxy_traffic_samples (
+                            instance_id, process_id, sampled_at,
+                            active_connections, current_speed
+                        ) VALUES (
+                            :instance_id, :process_id, :sampled_at,
+                            :active_connections, :current_speed
+                        )
+                        ON CONFLICT (instance_id, process_id, sampled_at) DO UPDATE SET
+                            active_connections = excluded.active_connections,
+                            current_speed = excluded.current_speed
+                        """,
+                        {
+                            "instance_id": self._identity.instance_id,
+                            "process_id": self._process_id,
+                            "sampled_at": sampled_at,
+                            "active_connections": active_connections,
+                            "current_speed": current_speed,
+                        },
                     )
-                    ON CONFLICT (instance_id, process_id, sampled_at) DO UPDATE SET
-                        active_connections = excluded.active_connections,
-                        current_speed = excluded.current_speed
-                    """,
-                    {
-                        "instance_id": self._identity.instance_id,
-                        "process_id": self._process_id,
-                        "sampled_at": sampled_at,
-                        "active_connections": active_connections,
-                        "current_speed": current_speed,
-                    },
-                )
                 if now >= total_sync_due:
                     await self._flush_pending_bytes(now)
                     total_sync_due = now + _TOTAL_SYNC_INTERVAL_SECONDS

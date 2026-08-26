@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from databases import Database
 
@@ -127,6 +127,24 @@ class UsenetOperationMonitorTests(unittest.IsolatedAsyncioTestCase):
             {"id": operation_id},
         )
         self.assertGreater(updated_at, 1)
+
+    async def test_idle_sync_does_not_poll_operation_cancellations(self):
+        with (
+            patch.object(
+                self.database,
+                "execute_many",
+                new=AsyncMock(),
+            ) as execute_many,
+            patch.object(
+                self.database,
+                "fetch_all",
+                new=AsyncMock(),
+            ) as fetch_all,
+        ):
+            await self.monitor._sync_operations()
+
+        execute_many.assert_not_awaited()
+        fetch_all.assert_not_awaited()
 
     async def test_shutdown_cancels_and_joins_bound_native_work(self):
         operation_id = await self.monitor.start(

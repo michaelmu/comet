@@ -17,9 +17,13 @@ At startup, Comet:
 2. applies additive schema migrations tracked in `schema_migrations`
 3. ensures current indexes and removes legacy superseded indexes
 4. clears transient tables (`active_connections`, `metrics_cache`)
-5. runs startup cleanup sweep depending on `DATABASE_STARTUP_CLEANUP_INTERVAL`
+5. runs a retention cleanup sweep depending on
+   `DATABASE_STARTUP_CLEANUP_INTERVAL`
 
-Startup cleanup handles TTL-based deletion for cache tables and job-history retention.
+The same interval schedules retention while the process remains healthy, so
+TTL-based cache and job-history deletion does not depend on restarts. A value of
+`0` runs cleanup at every startup without scheduling it periodically; a negative
+value disables automatic retention.
 
 ## Read Replicas
 
@@ -60,7 +64,8 @@ TTL; no media association is persisted in the public release repository.
 ## Operational Advice
 
 - Keep `DATABASE_BATCH_SIZE` tuned to your hardware for import/export.
-- Keep `DATABASE_STARTUP_CLEANUP_INTERVAL` non-zero in larger deployments to avoid heavy cleanup every restart.
+- Keep `DATABASE_STARTUP_CLEANUP_INTERVAL` positive in larger deployments to
+  spread cleanup across restarts and bound retained data during long uptimes.
 - Use the [Prometheus and Grafana integration](07-observability.md) to monitor database latency, errors, and read-replica fallbacks without running aggregate queries on each scrape.
 
 ## Next

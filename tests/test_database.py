@@ -1,4 +1,6 @@
+import asyncio
 import os
+import sqlite3
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -264,6 +266,80 @@ class DatabaseSetupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertRaisesRegex(RuntimeError, "implementation failed"),
             ):
                 await cleanup()
+
+    async def test_periodic_retention_waits_for_the_configured_interval(self):
+        sleeps = 0
+
+        async def bounded_sleep(delay):
+            nonlocal sleeps
+            self.assertEqual(delay, 123)
+            sleeps += 1
+            if sleeps == 2:
+                raise asyncio.CancelledError
+
+        cleanup = AsyncMock()
+        with (
+            patch.object(
+                database_module.settings,
+                "DATABASE_STARTUP_CLEANUP_INTERVAL",
+                123,
+            ),
+            patch.object(database_module.asyncio, "sleep", bounded_sleep),
+            patch.object(database_module, "_run_startup_cleanup", cleanup),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await database_module.cleanup_expired_database_state()
+
+        cleanup.assert_awaited_once_with()
+
+    async def test_nonpositive_retention_interval_has_no_periodic_task_work(self):
+        for interval in (-1, 0):
+            with (
+                self.subTest(interval=interval),
+                patch.object(
+                    database_module.settings,
+                    "DATABASE_STARTUP_CLEANUP_INTERVAL",
+                    interval,
+                ),
+                patch.object(
+                    database_module.asyncio, "sleep", new=AsyncMock()
+                ) as sleep,
+                patch.object(
+                    database_module,
+                    "_run_startup_cleanup",
+                    new=AsyncMock(),
+                ) as cleanup,
+            ):
+                await database_module.cleanup_expired_database_state()
+
+            sleep.assert_not_awaited()
+            cleanup.assert_not_awaited()
+
+    async def test_periodic_retention_retries_after_database_failure(self):
+        sleeps = 0
+
+        async def bounded_sleep(_delay):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 3:
+                raise asyncio.CancelledError
+
+        cleanup = AsyncMock(side_effect=[sqlite3.OperationalError("busy"), None])
+        with (
+            patch.object(
+                database_module.settings,
+                "DATABASE_STARTUP_CLEANUP_INTERVAL",
+                123,
+            ),
+            patch.object(database_module.asyncio, "sleep", bounded_sleep),
+            patch.object(database_module, "_run_startup_cleanup", cleanup),
+            patch.object(database_module.log, "error") as log_error,
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await database_module.cleanup_expired_database_state()
+
+        self.assertEqual(cleanup.await_count, 2)
+        log_error.assert_called_once()
 
     async def test_teardown_propagates_disconnect_failure(self):
         with (

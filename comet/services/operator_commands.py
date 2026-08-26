@@ -28,6 +28,7 @@ ScraperCommand = Literal[
 UsenetCommand = Literal["usenet.drain", "usenet.resume"]
 _COMMAND_TIMEOUT_SECONDS = 3
 _POLL_INTERVAL_SECONDS = 0.1
+_RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 0.5
 _OWNER_STALE_SECONDS = 1
 _COMMAND_RETENTION_SECONDS = 5 * 60
 
@@ -220,57 +221,61 @@ async def run_command_dispatcher() -> None:
     identity = RuntimeIdentity.current()
     process_id = os.getpid()
     next_cleanup = 0.0
+    next_heartbeat = 0.0
     while True:
         now = time.time()
-        state = (
-            "paused"
-            if background_scraper.is_paused
-            else "running"
-            if background_scraper.is_running
-            else "stopped"
-        )
-        await database.execute(
-            """
-            INSERT INTO background_scraper_runtimes (
-                instance_id, process_id, state, draining, run_id, started_at,
-                processed, success, failed, torrents_found,
-                discovered_items, errors, last_heartbeat
-            ) VALUES (
-                :instance_id, :process_id, :state, :draining, :run_id, :started_at,
-                :processed, :success, :failed, :torrents_found,
-                :discovered_items, :errors, :last_heartbeat
+        schedule_now = time.monotonic()
+        if schedule_now >= next_heartbeat:
+            state = (
+                "paused"
+                if background_scraper.is_paused
+                else "running"
+                if background_scraper.is_running
+                else "stopped"
             )
-            ON CONFLICT (instance_id, process_id) DO UPDATE SET
-                state = excluded.state,
-                draining = excluded.draining,
-                run_id = excluded.run_id,
-                started_at = excluded.started_at,
-                processed = excluded.processed,
-                success = excluded.success,
-                failed = excluded.failed,
-                torrents_found = excluded.torrents_found,
-                discovered_items = excluded.discovered_items,
-                errors = excluded.errors,
-                last_heartbeat = excluded.last_heartbeat
-            """,
-            {
-                "instance_id": identity.instance_id,
-                "process_id": process_id,
-                "state": state,
-                "draining": int(background_scraper.drain_requested),
-                "run_id": background_scraper.current_run_id,
-                "started_at": background_scraper.stats.start_time or None,
-                "processed": background_scraper.stats.total_processed,
-                "success": background_scraper.stats.total_success,
-                "failed": background_scraper.stats.total_failed,
-                "torrents_found": background_scraper.stats.total_torrents_found,
-                "discovered_items": background_scraper.stats.discovered_items,
-                "errors": background_scraper.stats.errors,
-                "last_heartbeat": now,
-            },
-        )
+            await database.execute(
+                """
+                INSERT INTO background_scraper_runtimes (
+                    instance_id, process_id, state, draining, run_id, started_at,
+                    processed, success, failed, torrents_found,
+                    discovered_items, errors, last_heartbeat
+                ) VALUES (
+                    :instance_id, :process_id, :state, :draining, :run_id, :started_at,
+                    :processed, :success, :failed, :torrents_found,
+                    :discovered_items, :errors, :last_heartbeat
+                )
+                ON CONFLICT (instance_id, process_id) DO UPDATE SET
+                    state = excluded.state,
+                    draining = excluded.draining,
+                    run_id = excluded.run_id,
+                    started_at = excluded.started_at,
+                    processed = excluded.processed,
+                    success = excluded.success,
+                    failed = excluded.failed,
+                    torrents_found = excluded.torrents_found,
+                    discovered_items = excluded.discovered_items,
+                    errors = excluded.errors,
+                    last_heartbeat = excluded.last_heartbeat
+                """,
+                {
+                    "instance_id": identity.instance_id,
+                    "process_id": process_id,
+                    "state": state,
+                    "draining": int(background_scraper.drain_requested),
+                    "run_id": background_scraper.current_run_id,
+                    "started_at": background_scraper.stats.start_time or None,
+                    "processed": background_scraper.stats.total_processed,
+                    "success": background_scraper.stats.total_success,
+                    "failed": background_scraper.stats.total_failed,
+                    "torrents_found": background_scraper.stats.total_torrents_found,
+                    "discovered_items": background_scraper.stats.discovered_items,
+                    "errors": background_scraper.stats.errors,
+                    "last_heartbeat": now,
+                },
+            )
+            next_heartbeat = schedule_now + _RUNTIME_HEARTBEAT_INTERVAL_SECONDS
         await _consume_pending_command(identity, process_id, _HANDLERS)
-        if now >= next_cleanup:
+        if schedule_now >= next_cleanup:
             await database.execute(
                 """
                 DELETE FROM operator_commands
@@ -285,7 +290,7 @@ async def run_command_dispatcher() -> None:
                 """,
                 {"cutoff": now - _OWNER_STALE_SECONDS * 10},
             )
-            next_cleanup = now + 60
+            next_cleanup = schedule_now + 60
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
 

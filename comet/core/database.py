@@ -993,6 +993,24 @@ async def cleanup_expired_usenet_state():
             )
 
 
+async def cleanup_expired_database_state():
+    interval = settings.DATABASE_STARTUP_CLEANUP_INTERVAL
+    if interval <= 0:
+        return
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _run_startup_cleanup()
+        except (OSError, sqlite3.Error, asyncpg.PostgresError) as exc:
+            log.error(
+                "database.retention.failed",
+                "Periodic database retention failed",
+                error_code="cleanup_failure",
+                exc=exc,
+            )
+
+
 async def _should_run_startup_cleanup(current_time: float, interval: int):
     row = await database.fetch_one(
         "SELECT last_startup_cleanup_at FROM db_maintenance WHERE id = 1",
