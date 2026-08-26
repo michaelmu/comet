@@ -81,6 +81,14 @@ class EngineNntpError(RuntimeError):
         self.source_failure = code in _NNTP_SOURCE_FAILURES
 
 
+class _ProviderSetRegistrationLock:
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
 class EngineArchiveError(RuntimeError):
     def __init__(
         self,
@@ -367,7 +375,7 @@ class EngineClient(EngineTransport):
     def __init__(self, descriptor_path: str | Path):
         super().__init__(descriptor_path)
         self._provider_set_ids: dict[str, str] = {}
-        self._provider_set_locks: dict[str, asyncio.Lock] = {}
+        self._provider_set_locks: dict[str, _ProviderSetRegistrationLock] = {}
         self._reported_degraded_sessions: set[str] = set()
 
     def _load_descriptor(self) -> EngineDescriptor:
@@ -1656,6 +1664,7 @@ class EngineClient(EngineTransport):
             f"/v1/sessions/{identity}/readers/{reader_lease_id}",
             "session",
         )
+        self._reported_degraded_sessions.discard(identity)
 
     async def _close_native_reader(self, path: str, label: str) -> None:
         status, _headers, body = await self.request("DELETE", path, b"")
@@ -2078,46 +2087,57 @@ class EngineClient(EngineTransport):
     ) -> str:
         if provider_set_id := self._provider_set_ids.get(generation):
             return provider_set_id
-        lock = self._provider_set_locks.setdefault(generation, asyncio.Lock())
-        async with lock:
-            if provider_set_id := self._provider_set_ids.get(generation):
+        registration_state = self._provider_set_locks.get(generation)
+        if registration_state is None:
+            registration_state = _ProviderSetRegistrationLock()
+            self._provider_set_locks[generation] = registration_state
+        registration_state.users += 1
+        try:
+            async with registration_state.lock:
+                if provider_set_id := self._provider_set_ids.get(generation):
+                    return provider_set_id
+                status, _headers, body = await self.request(
+                    "PUT",
+                    f"/v1/provider-sets/{generation}",
+                    registration,
+                )
+                try:
+                    registered = orjson.loads(body)
+                except ValueError as exc:
+                    raise EngineUnavailable(
+                        "Usenet engine returned invalid provider-set data"
+                    ) from exc
+                if status != 200:
+                    code, retryable = _decode_engine_failure(
+                        registered,
+                        label="provider-set",
+                    )
+                    raise EngineNntpError(code, retryable=retryable)
+                provider_set_id = (
+                    registered.get("provider_set_id")
+                    if isinstance(registered, dict)
+                    else None
+                )
+                if (
+                    not isinstance(registered, dict)
+                    or set(registered)
+                    != {
+                        "version",
+                        "provider_set_id",
+                        "generation",
+                    }
+                    or registered["version"] != 1
+                    or registered["generation"] != generation
+                ):
+                    raise EngineUnavailable(
+                        "Usenet engine returned invalid provider-set data"
+                    )
+                self._provider_set_ids[generation] = provider_set_id
                 return provider_set_id
-            status, _headers, body = await self.request(
-                "PUT",
-                f"/v1/provider-sets/{generation}",
-                registration,
-            )
-            try:
-                registered = orjson.loads(body)
-            except ValueError as exc:
-                raise EngineUnavailable(
-                    "Usenet engine returned invalid provider-set data"
-                ) from exc
-            if status != 200:
-                code, retryable = _decode_engine_failure(
-                    registered,
-                    label="provider-set",
-                )
-                raise EngineNntpError(code, retryable=retryable)
-            provider_set_id = (
-                registered.get("provider_set_id")
-                if isinstance(registered, dict)
-                else None
-            )
+        finally:
+            registration_state.users -= 1
             if (
-                not isinstance(registered, dict)
-                or set(registered)
-                != {
-                    "version",
-                    "provider_set_id",
-                    "generation",
-                }
-                or registered["version"] != 1
-                or registered["generation"] != generation
+                registration_state.users == 0
+                and self._provider_set_locks.get(generation) is registration_state
             ):
-                raise EngineUnavailable(
-                    "Usenet engine returned invalid provider-set data"
-                )
-            self._provider_set_ids[generation] = provider_set_id
-        self._provider_set_locks.pop(generation, None)
-        return provider_set_id
+                self._provider_set_locks.pop(generation, None)

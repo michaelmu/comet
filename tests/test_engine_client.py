@@ -2011,7 +2011,10 @@ class EngineClientTests(unittest.IsolatedAsyncioTestCase):
             await client.open_session_reader(identity),
             reader_lease_id,
         )
+        client._reported_degraded_sessions.add(identity)
         await client.close_session_reader(identity, reader_lease_id)
+
+        self.assertNotIn(identity, client._reported_degraded_sessions)
 
         self.assertEqual(
             [call.args for call in client.request.await_args_list],
@@ -2305,6 +2308,63 @@ class EngineClientTests(unittest.IsolatedAsyncioTestCase):
             ),
             8,
         )
+
+    async def test_failed_provider_registration_does_not_retain_its_lock(self):
+        client = EngineClient("/missing/engine.json")
+        client.request = AsyncMock(side_effect=EngineUnavailable("offline"))
+
+        with self.assertRaisesRegex(EngineUnavailable, "offline"):
+            await client._provider_set_id("b" * 64, b"{}")
+
+        self.assertEqual(client._provider_set_locks, {})
+
+    async def test_failed_provider_registration_keeps_waiters_singleflight(self):
+        client = EngineClient("/missing/engine.json")
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+        release_second = asyncio.Event()
+        calls = 0
+        active = 0
+        max_active = 0
+
+        async def request(*_args):
+            nonlocal calls, active, max_active
+            calls += 1
+            call = calls
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                if call == 1:
+                    first_started.set()
+                    await release_first.wait()
+                    raise EngineUnavailable("offline")
+                second_started.set()
+                await release_second.wait()
+                return provider_set_registration()
+            finally:
+                active -= 1
+
+        client.request = request
+        generation = "b" * 64
+        first = asyncio.create_task(client._provider_set_id(generation, b"{}"))
+        await first_started.wait()
+        second = asyncio.create_task(client._provider_set_id(generation, b"{}"))
+        await asyncio.sleep(0)
+        release_first.set()
+        with self.assertRaisesRegex(EngineUnavailable, "offline"):
+            await first
+
+        await second_started.wait()
+        third = asyncio.create_task(client._provider_set_id(generation, b"{}"))
+        await asyncio.sleep(0)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(max_active, 1)
+        release_second.set()
+        self.assertEqual(await second, "P" * 22)
+        self.assertEqual(await third, "P" * 22)
+        self.assertEqual(client._provider_set_locks, {})
 
     async def test_native_inspection_registers_then_submits_only_bounded_probe_metadata(
         self,
