@@ -140,6 +140,10 @@ class DiscoveryService:
 
         # Known peers by address
         self._known_peers: dict[str, KnownPeer] = {}
+        # Insertion-ordered index used as an LRU for unsolicited incoming peers.
+        # Keeping this separate preserves the public/source-priority ordering of
+        # _known_peers while making admission and eviction constant-time.
+        self._incoming_order: dict[str, None] = {}
 
         # Callbacks
         self._connect_callback: Callable[[str], Awaitable[str | None]] | None = None
@@ -252,7 +256,23 @@ class DiscoveryService:
 
     def record_incoming_connection(self, node_id: str, address: str) -> None:
         """Record a peer that connected to us."""
+        existing = self._known_peers.get(address)
+        if existing is not None:
+            self._add_known_peer(address=address, node_id=node_id, source="incoming")
+            if existing.source == "incoming":
+                existing.last_seen = time.time()
+                self._incoming_order.pop(address, None)
+                self._incoming_order[address] = None
+            return
+
+        if self.max_peers <= 0:
+            return
+        if len(self._incoming_order) >= self.max_peers:
+            oldest_address = next(iter(self._incoming_order))
+            del self._incoming_order[oldest_address]
+            del self._known_peers[oldest_address]
         self._add_known_peer(address=address, node_id=node_id, source="incoming")
+        self._incoming_order[address] = None
 
     async def get_peers_for_pex(self, max_peers: int | None = None) -> list[PeerInfo]:
         """Get a list of peers to share via PEX."""
@@ -427,11 +447,15 @@ class DiscoveryService:
             addr
             for addr, peer in self._known_peers.items()
             if peer.last_seen < cutoff
-            and peer.connect_failures > settings.COMETNET_PEER_MAX_FAILURES
             and peer.source not in ("manual", "bootstrap")
+            and (
+                peer.source == "incoming"
+                or peer.connect_failures > settings.COMETNET_PEER_MAX_FAILURES
+            )
         ]
         for addr in to_remove:
             del self._known_peers[addr]
+            self._incoming_order.pop(addr, None)
 
     def get_stats(self) -> dict:
         """Get discovery statistics."""
@@ -516,3 +540,4 @@ class DiscoveryService:
         known_peers = {peer["address"]: KnownPeer(**peer) for peer in canonical_peers}
 
         self._known_peers = known_peers
+        self._incoming_order.clear()

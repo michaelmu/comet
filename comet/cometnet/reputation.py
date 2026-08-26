@@ -6,9 +6,12 @@ Implements the reputation system for tracking peer trustworthiness.
 
 import math
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from comet.core.models import settings
+
+_DEFAULT_MAX_PEERS = 10_000
 
 
 @dataclass
@@ -98,8 +101,11 @@ class ReputationStore:
     This is an in-memory store that can be persisted to disk.
     """
 
-    def __init__(self):
-        self._peers: dict[str, PeerReputation] = {}
+    def __init__(self, max_peers: int = _DEFAULT_MAX_PEERS):
+        if max_peers <= 0:
+            raise ValueError("max_peers must be positive")
+        self.max_peers = max_peers
+        self._peers: OrderedDict[str, PeerReputation] = OrderedDict()
 
     @staticmethod
     def _validate_node_id(node_id: object) -> str:
@@ -163,9 +169,15 @@ class ReputationStore:
 
     def get_or_create(self, node_id: str) -> PeerReputation:
         """Get an existing peer reputation or create a new one."""
-        if node_id not in self._peers:
-            self._peers[node_id] = PeerReputation()
-        return self._peers[node_id]
+        peer = self._peers.get(node_id)
+        if peer is None:
+            if len(self._peers) >= self.max_peers:
+                self._peers.popitem(last=False)
+            peer = PeerReputation()
+            self._peers[node_id] = peer
+        else:
+            self._peers.move_to_end(node_id)
+        return peer
 
     def get(self, node_id: str) -> PeerReputation | None:
         """Get peer reputation if it exists."""
@@ -206,22 +218,35 @@ class ReputationStore:
         }
 
     @classmethod
-    def _decode_persisted(cls, data: object) -> dict[str, PeerReputation]:
+    def _decode_persisted(
+        cls,
+        data: object,
+        *,
+        max_peers: int,
+    ) -> OrderedDict[str, PeerReputation]:
         if type(data) is not dict or "peers" not in data:
             raise ValueError("reputation store does not match the current schema")
         if type(data["peers"]) is not dict:
             raise ValueError("reputation peers container is invalid")
-
-        return dict(
+        peers = (
             cls._peer_from_persisted(node_id, value)
             for node_id, value in data["peers"].items()
         )
+        decoded = OrderedDict(sorted(peers, key=lambda item: item[1].last_seen))
+        while len(decoded) > max_peers:
+            decoded.popitem(last=False)
+        return decoded
 
     @classmethod
-    def validate_persisted(cls, data: object) -> None:
+    def validate_persisted(
+        cls,
+        data: object,
+        *,
+        max_peers: int = _DEFAULT_MAX_PEERS,
+    ) -> None:
         """Validate a complete persisted candidate without publishing it."""
-        cls._decode_persisted(data)
+        cls._decode_persisted(data, max_peers=max_peers)
 
     def from_dict(self, data: dict) -> None:
         """Load the store from a dictionary."""
-        self._peers = self._decode_persisted(data)
+        self._peers = self._decode_persisted(data, max_peers=self.max_peers)

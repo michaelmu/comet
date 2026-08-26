@@ -32,6 +32,21 @@ class CometNetReputationStoreTests(unittest.TestCase):
         self.assertEqual(peer.valid_contributions, 2)
         self.assertEqual(peer.invalid_contributions, 1)
 
+    def test_peer_catalog_evicts_the_least_recently_seen_entry(self):
+        store = ReputationStore(max_peers=2)
+        store.get_or_create("old").last_seen = 1
+        store.get_or_create("new").last_seen = 2
+
+        store.get_or_create("newest")
+
+        self.assertEqual(set(store._peers), {"new", "newest"})
+
+    def test_persisted_catalog_keeps_freshest_entries_within_runtime_bound(self):
+        store = ReputationStore(max_peers=1)
+        store.from_dict(current_reputation())
+
+        self.assertEqual(set(store._peers), {"peer-b"})
+
     def test_persisted_schema_is_extensible_atomic_and_deterministic(self):
         store = ReputationStore()
         store.from_dict(current_reputation())
