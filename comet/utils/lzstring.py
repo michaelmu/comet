@@ -1,24 +1,37 @@
+import re
+
+
 _URI_SAFE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-$"
-_URI_SAFE_REVERSE = {
-    character: index for index, character in enumerate(_URI_SAFE_ALPHABET)
-}
+_INVALID_URI_SYMBOL = 255
+_URI_SAFE_REVERSE = bytes(
+    index
+    if (index := _URI_SAFE_ALPHABET.find(chr(value))) >= 0
+    else _INVALID_URI_SYMBOL
+    for value in range(256)
+)
+_URI_SAFE_PATTERN = re.compile(rb"[A-Za-z0-9+$-]+")
 
 
 def decompressFromEncodedURIComponent(input_str):
     if input_str is None:
         return ""
-    if input_str == "":
+    if type(input_str) is str:
+        try:
+            input_data = input_str.replace(" ", "+").encode("ascii")
+        except UnicodeEncodeError:
+            return None
+    elif type(input_str) is bytes:
+        input_data = input_str.replace(b" ", b"+")
+    else:
         return None
-    if type(input_str) is not str:
+    if not input_data or _URI_SAFE_PATTERN.fullmatch(input_data) is None:
         return None
 
-    input_str = input_str.replace(" ", "+")
-
-    input_data = [_URI_SAFE_REVERSE.get(character) for character in input_str]
-    if any(value is None for value in input_data):
-        return None
-
-    return _decompress(len(input_data), 32, input_data)
+    return _decompress(
+        len(input_data),
+        32,
+        input_data,
+    )
 
 
 def _decompress(length, reset_value, input_data):
@@ -28,7 +41,7 @@ def _decompress(length, reset_value, input_data):
     bit_count = 3
     result = []
 
-    data_value = input_data[0]
+    data_value = _URI_SAFE_REVERSE[input_data[0]]
     position = reset_value
     index = 1
 
@@ -44,7 +57,7 @@ def _decompress(length, reset_value, input_data):
                 position = reset_value
                 if index >= length:
                     return None
-                data_value = input_data[index]
+                data_value = _URI_SAFE_REVERSE[input_data[index]]
                 index += 1
             if bit:
                 bits |= power

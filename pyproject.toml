@@ -55,6 +55,7 @@ extend-immutable-calls = ["fastapi.Depends"]
 "comet/web.py" = ["E402"]
 # Standalone benchmarks add the repository root before importing Comet.
 "scripts/live_usenet_compatibility_probe.py" = ["E402"]
+"scripts/measure_results_config_sizes.py" = ["E402"]
 "scripts/run_usenet_provider_benchmark.py" = ["E402"]
 "scripts/run_results_pipeline_benchmark.py" = ["E402"]
 "scripts/run_usenet_search_benchmark.py" = ["E402"]

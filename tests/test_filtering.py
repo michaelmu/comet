@@ -170,6 +170,56 @@ class AliasFilteringTests(unittest.TestCase):
 
         self.assertEqual(actual[0]["parsed"].languages, ["it"])
 
+    def test_language_enrichment_does_not_mutate_the_cached_parse(self):
+        title = "Il.Postino.2020.1080p.WEB-DL"
+        with patch.object(settings, "SMART_LANGUAGE_DETECTION", True):
+            enriched = filter_release_records(
+                [{"title": title, "infoHash": "1" * 40}],
+                "The Postman",
+                2020,
+                None,
+                "movie",
+                {"lang:it": ["Il Postino"]},
+                False,
+            )
+            plain = filter_release_records(
+                [{"title": title, "infoHash": "2" * 40}],
+                "Il Postino",
+                2020,
+                None,
+                "movie",
+                {},
+                False,
+            )
+
+        self.assertEqual(enriched[0]["parsed"].languages, ["it"])
+        self.assertEqual(plain[0]["parsed"].languages, [])
+
+    def test_plain_filtered_result_does_not_expose_cached_languages(self):
+        title = "Movie.2026.1080p.WEB-DL"
+        first = filter_release_records(
+            [{"title": title, "infoHash": "1" * 40}],
+            "Movie",
+            2026,
+            None,
+            "movie",
+            {},
+            False,
+        )
+        first[0]["parsed"].languages.append("fr")
+
+        second = filter_release_records(
+            [{"title": title, "infoHash": "2" * 40}],
+            "Movie",
+            2026,
+            None,
+            "movie",
+            {},
+            False,
+        )
+
+        self.assertEqual(second[0]["parsed"].languages, [])
+
     def test_movie_named_sample_is_not_rejected_by_filename_heuristic(self):
         actual = filter_release_records(
             [{"title": "The.Sample.2026.1080p.WEB-DL", "infoHash": "1" * 40}],

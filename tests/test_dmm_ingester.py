@@ -18,6 +18,9 @@ class DmmArchiveTests(unittest.TestCase):
     def test_lz_decoder_handles_valid_and_malformed_inputs(self):
         encoded = "BIUwNmD2AEDukCcwBMg"
         self.assertEqual(decompressFromEncodedURIComponent(encoded), "Hello world")
+        self.assertEqual(
+            decompressFromEncodedURIComponent(encoded.encode()), "Hello world"
+        )
         self.assertIsNone(decompressFromEncodedURIComponent("invalid%character"))
         self.assertIsNone(decompressFromEncodedURIComponent("A"))
 
@@ -47,7 +50,7 @@ class DmmArchiveTests(unittest.TestCase):
                 return_value="[]",
             ) as decompress:
                 self.assertEqual(process_file_sync(hashlist), [])
-                decompress.assert_called_once_with("payload")
+                decompress.assert_called_once_with(b"payload")
 
     def test_hashlist_decode_isolates_malformed_items(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -104,7 +107,7 @@ class DmmArchiveTests(unittest.TestCase):
             ):
                 process_file_sync(path)
 
-    def test_hashlist_decode_has_no_dmm_specific_size_or_cardinality_cap(self):
+    def test_hashlist_decode_has_no_dmm_specific_cardinality_cap(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "hashlist.html"
             path.write_text('hashlist#payload"')
@@ -114,7 +117,7 @@ class DmmArchiveTests(unittest.TestCase):
             ) as decompress:
                 self.assertEqual(process_file_sync(path), [])
 
-            decompress.assert_called_once_with("payload")
+            decompress.assert_called_once_with(b"payload")
 
     def test_extract_rejects_path_traversal_before_writing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -217,7 +220,7 @@ class DmmDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.done())
         self.assertIsNone(ingester._runner_task)
 
-    async def test_download_is_fixed_origin_and_streamed_without_size_cap(self):
+    async def test_download_is_fixed_origin_and_streamed(self):
         class Content:
             def __init__(self):
                 self.chunks = [b"12345", b""]

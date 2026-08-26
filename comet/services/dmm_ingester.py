@@ -168,7 +168,13 @@ class DMMIngester:
 
             total_files = len(new_files)
 
-            batch_size = settings.DMM_INGEST_BATCH_SIZE
+            # Do not retain decoded result lists for more files than can be
+            # processed concurrently. Large hashlists can each occupy hundreds
+            # of MiB while their database rows are awaiting publication.
+            batch_size = min(
+                settings.DMM_INGEST_BATCH_SIZE,
+                settings.DMM_INGEST_CONCURRENT_WORKERS,
+            )
 
             for i in range(0, total_files, batch_size):
                 batch_files = new_files[i : i + batch_size]
@@ -256,7 +262,7 @@ class DMMIngester:
             await database.execute_many(query, values)
 
 
-HASHLIST_REGEX = re.compile(r'hashlist#(.*?)"')
+HASHLIST_REGEX = re.compile(rb'hashlist#(.*?)"')
 
 
 def process_file_sync(file_path):
@@ -265,17 +271,14 @@ def process_file_sync(file_path):
             raw_content = f.read()
     except OSError:
         return None
-    try:
-        content = raw_content.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-    match = HASHLIST_REGEX.search(content)
+    match = HASHLIST_REGEX.search(raw_content)
     if not match:
         return []
 
     encoded_data = match.group(1)
+    del match, raw_content
     json_str = decompressFromEncodedURIComponent(encoded_data)
+    del encoded_data
 
     if not json_str:
         return None
@@ -284,6 +287,7 @@ def process_file_sync(file_path):
         data = orjson.loads(json_str)
     except orjson.JSONDecodeError:
         return None
+    del json_str
 
     results = []
     if isinstance(data, list):

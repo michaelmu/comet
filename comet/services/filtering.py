@@ -147,6 +147,7 @@ class TitleMatcher:
         "max_year",
         "min_year",
         "title",
+        "title_match_aliases",
         "year",
         "year_end",
     )
@@ -156,6 +157,10 @@ class TitleMatcher:
         self.year = year
         self.year_end = year_end
         self.aliases = aliases
+        # RTN treats None and an empty mapping identically, but None uses its
+        # cached empty JSON document instead of validating and serializing an
+        # empty mapping for every candidate.
+        self.title_match_aliases = aliases or None
         self.aliases_normalized = frozenset(
             normalized
             for titles in self.aliases.values()
@@ -179,7 +184,7 @@ class TitleMatcher:
         if exact_alias_match(scrub(parsed_title), self.aliases_normalized):
             return True
         return title_match(
-            self.title, parsed_title, aliases=self.aliases
+            self.title, parsed_title, aliases=self.title_match_aliases
         ) or alternate_title_match(torrent_title, self.title, self.aliases)
 
     def matches_year(self, parsed_year: int | None) -> bool:
@@ -236,7 +241,7 @@ def _parse_cache_shard_for(title: str):
 
 
 def _clone_parsed(parsed):
-    # Filtering only mutates languages; keep immutable parse fields shared.
+    # Filtering only mutates languages; keep all other parse fields shared.
     clone = parsed.model_copy()
     clone.languages = list(parsed.languages)
     return clone
@@ -258,13 +263,12 @@ def _parse_with_cache_simple(title: str, shard: _ParseCacheShard, max_size: int)
         cached = shard.data.get(title)
         if cached is not None:
             shard.data.move_to_end(title)
-            return _clone_parsed(cached)
+            return cached
 
     parsed = parse(title)
-    cached = _clone_parsed(parsed)
 
     with shard.lock:
-        shard.data[title] = cached
+        shard.data[title] = parsed
         if len(shard.data) > max_size:
             shard.data.popitem(last=False)
 
@@ -279,7 +283,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
         cached = shard.data.get(title)
         if cached is not None:
             shard.data.move_to_end(title)
-            return _clone_parsed(cached)
+            return cached
 
         inflight_event = shard.inflight.get(title)
         if inflight_event is None:
@@ -295,7 +299,7 @@ def _parse_with_cache_dedup(title: str, shard: _ParseCacheShard, max_size: int):
             cached = shard.data.get(title)
             if cached is not None:
                 shard.data.move_to_end(title)
-                return _clone_parsed(cached)
+                return cached
 
         return parse(title)
 
@@ -310,9 +314,8 @@ def _do_parse_and_cache(
 ):
     try:
         parsed = parse(title)
-        cached = _clone_parsed(parsed)
         with shard.lock:
-            shard.data[title] = cached
+            shard.data[title] = parsed
             if len(shard.data) > max_size:
                 shard.data.popitem(last=False)
             shard.inflight.pop(title, None)
@@ -401,9 +404,19 @@ def filter_release_records(
             )
             continue
 
-        if parsed.parsed_title and country_aliases:
-            language = country_aliases.get(scrub(parsed.parsed_title))
-            if language and language not in parsed.languages:
+        language = (
+            country_aliases.get(scrub(parsed.parsed_title))
+            if parsed.parsed_title and country_aliases
+            else None
+        )
+        add_language = language is not None and language not in parsed.languages
+        add_multi = (len(parsed.languages) > 1 or parsed.dubbed) and (
+            not parsed.languages or parsed.languages[0] != "multi"
+        )
+        parsed_is_owned = add_language or add_multi
+        if add_language or add_multi:
+            parsed = _clone_parsed(parsed)
+            if add_language:
                 _log_filter_decision(
                     "alias_language",
                     release_title,
@@ -461,6 +474,8 @@ def filter_release_records(
             )
             continue
 
+        if not parsed_is_owned:
+            parsed = _clone_parsed(parsed)
         record["parsed"] = parsed
         results.append(record)
     return results

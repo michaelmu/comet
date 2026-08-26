@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -38,16 +37,9 @@ class AnimeMappingPayloadError(ValueError):
     pass
 
 
-def _reject_json_constant(_value):
-    raise ValueError("invalid anime JSON constant")
-
-
 def _decode_json(document: bytes | str):
     try:
-        return json.loads(
-            document,
-            parse_constant=_reject_json_constant,
-        )
+        return orjson.loads(document)
     except (TypeError, ValueError, RecursionError):
         raise ValueError("invalid anime JSON") from None
 
