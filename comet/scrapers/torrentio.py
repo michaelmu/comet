@@ -59,12 +59,14 @@ class TorrentioScraper(BaseScraper):
             async with self.session.get(
                 f"{self.url}/stream/{request.media_type}/{request.media_id}.json",
             ) as response:
+                if getattr(response, "status", 200) != 200:
+                    raise RuntimeError(f"upstream HTTP {response.status}")
                 results = await response.json()
 
             if not isinstance(results, dict) or not isinstance(
                 results.get("streams"), list
             ):
-                return []
+                raise ValueError("response payload is missing a streams list")
 
             for torrent in results["streams"]:
                 parsed = self._parse_stream(torrent)
@@ -72,5 +74,6 @@ class TorrentioScraper(BaseScraper):
                     torrents.append(parsed)
         except Exception as e:
             log_scraper_error("Torrentio", self.url, request.media_id, e)
+            raise
 
         return torrents

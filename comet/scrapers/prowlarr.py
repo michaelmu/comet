@@ -134,10 +134,13 @@ class ProwlarrScraper(BaseScraper):
         try:
             responses = await gather_with_error_logging(
                 (
-                    f"Prowlarr query {query!r} ({self.url})",
-                    self._fetch_search_results(query),
-                )
-                for query in queries
+                    (
+                        f"Prowlarr query {query!r} ({self.url})",
+                        self._fetch_search_results(query),
+                    )
+                    for query in queries
+                ),
+                raise_if_all_failed=True,
             )
             all_results = []
             for response in responses:
@@ -169,7 +172,9 @@ class ProwlarrScraper(BaseScraper):
 
         except Exception as e:
             logger.warning(
-                f"Exception while getting torrents for {request.title} with Prowlarr: {e}"
+                "Exception while getting torrents for "
+                f"{request.title} with Prowlarr: {type(e).__name__}"
             )
+            raise
 
         return deduplicate_torrents(torrents)

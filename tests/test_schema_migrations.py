@@ -14,6 +14,7 @@ from comet.core.schema_migrations import (
     _migration_debrid_account_cleanup_index,
     _migration_media_demand_scrape_coverage,
     _migration_original_indexer_titles,
+    _migration_scraper_health,
     _migration_tmdb_title_aliases,
     _rename_column_if_missing,
 )
@@ -21,6 +22,25 @@ from comet.core.schema_specs import ManagedTableSpec
 
 
 class SchemaMigrationMetadataCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scraper_health_migration_creates_state_table(self):
+        with TemporaryDirectory() as temp_dir:
+            database = ReplicaAwareDatabase(
+                Database(f"sqlite+aiosqlite:///{temp_dir}/migration.db")
+            )
+            await database.connect()
+            try:
+                context = MigrationContext(database, is_sqlite=True, is_postgres=False)
+                await _migration_scraper_health(context)
+
+                columns = await database.fetch_all("PRAGMA table_info(scraper_health)")
+                column_names = {column["name"] for column in columns}
+                self.assertIn("scraper_key", column_names)
+                self.assertIn("state", column_names)
+                self.assertIn("next_retry_at", column_names)
+                self.assertIn("last_error_type", column_names)
+            finally:
+                await database.disconnect()
+
     async def test_scope_coverage_migration_preserves_existing_demand(self):
         with TemporaryDirectory() as temp_dir:
             database = ReplicaAwareDatabase(

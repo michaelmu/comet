@@ -5,8 +5,9 @@ from comet.scrapers.torrentio import TorrentioScraper
 
 
 class _Response:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
         self.payload = payload
+        self.status = status
 
     async def __aenter__(self):
         return self
@@ -59,3 +60,17 @@ class TorrentioScraperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [torrent["infoHash"] for torrent in torrents], ["a" * 40, "c" * 40]
         )
+
+    async def test_invalid_response_contract_is_reported_as_failure(self):
+        scraper = TorrentioScraper(
+            None, _Session({"unexpected": []}), "https://torrentio.test"
+        )
+        request = ScrapeRequest(
+            media_type="movie",
+            media_id="tt123",
+            media_only_id="tt123",
+            title="Movie",
+        )
+
+        with self.assertRaisesRegex(ValueError, "streams list"):
+            await scraper.scrape(request)

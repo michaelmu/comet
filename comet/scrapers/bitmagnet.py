@@ -57,31 +57,32 @@ class BitmagnetScraper(BaseScraper):
     async def scrape_page(
         self, imdb_id, scrape_type, offset, limit, season=None, episode=None
     ):
-        try:
-            params = {
-                "t": scrape_type,
-                "imdbid": imdb_id,
-                "offset": offset,
-                "limit": limit,
-            }
-            if season is not None:
-                params["season"] = season
-            if episode is not None:
-                params["ep"] = episode
-            async with self.session.get(
-                f"{self.url}/torznab/api", params=params
-            ) as response:
-                data_text = await response.text()
-                if not data_text.strip():
-                    return []
+        params = {
+            "t": scrape_type,
+            "imdbid": imdb_id,
+            "offset": offset,
+            "limit": limit,
+        }
+        if season is not None:
+            params["season"] = season
+        if episode is not None:
+            params["ep"] = episode
+        async with self.session.get(
+            f"{self.url}/torznab/api", params=params
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
+            data_text = await response.text()
+            if not data_text.strip():
+                raise ValueError("empty response payload")
+            try:
                 root = ET.fromstring(data_text)
-                return self.parse_items(root)
-        except ET.ParseError as e:
-            logger.warning(f"Error parsing BitMagnet page offset={offset}: {e}")
-            return []
-        except Exception as e:
-            logger.warning(f"Error scraping BitMagnet page offset={offset}: {e}")
-            return []
+            except ET.ParseError:
+                logger.warning(
+                    f"Invalid XML from BitMagnet page offset={offset}: ParseError"
+                )
+                raise
+            return self.parse_items(root)
 
     async def scrape(self, request: ScrapeRequest):
         torrents = []

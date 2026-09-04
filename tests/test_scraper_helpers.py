@@ -28,7 +28,7 @@ class ScraperTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, ["result"])
         logger_opt.assert_called_once_with(depth=1)
         logger_opt.return_value.warning.assert_called_once_with(
-            "failed operation failed: RuntimeError: transport failed"
+            "failed operation failed: RuntimeError"
         )
 
     async def test_gather_does_not_absorb_task_cancellation(self):

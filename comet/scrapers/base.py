@@ -33,6 +33,8 @@ def deduplicate_torrents(torrents: list[dict]) -> list[dict]:
 
 async def gather_with_error_logging[T](
     tasks: Iterable[tuple[str, Awaitable[T]]],
+    *,
+    raise_if_all_failed: bool = False,
 ) -> list[T]:
     """Run independent tasks concurrently while preserving successful results."""
 
@@ -45,15 +47,21 @@ async def gather_with_error_logging[T](
         return_exceptions=True,
     )
     successful = []
+    failures: list[Exception] = []
     for (context, _), result in zip(entries, results, strict=True):
         if isinstance(result, BaseException):
             if not isinstance(result, Exception):
                 raise result
+            failures.append(result)
             logger.opt(depth=1).warning(
-                f"{context} failed: {type(result).__name__}: {result}"
+                f"{context} failed: {type(result).__name__}"
             )
             continue
         successful.append(result)
+
+    if raise_if_all_failed and failures and not successful:
+        raise RuntimeError("all concurrent tasks failed") from failures[-1]
+
     return successful
 
 

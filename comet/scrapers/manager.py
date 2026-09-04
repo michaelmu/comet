@@ -12,6 +12,7 @@ from comet.observability import metrics
 from comet.scrapers.base import BaseScraper
 from comet.scrapers.models import ScrapeRequest
 from comet.services.anime import anime_mapper
+from comet.services.scraper_health import scraper_health
 from comet.utils.network_manager import network_manager
 from comet.utils.parsing import (
     associate_urls_credentials,
@@ -97,11 +98,18 @@ class ScraperManager:
     ):
         started_at = time.perf_counter()
         outcome = "success"
+        error_type = None
         try:
             async with asyncio.timeout(timeout):
                 results = await scraper.scrape(request)
+            if not isinstance(results, list):
+                outcome = "invalid"
+                error_type = "InvalidResultContainer"
+                logger.warning(f"Scraper {name} returned an invalid result container")
+                results = []
         except TimeoutError:
             outcome = "timeout"
+            error_type = "TimeoutError"
             logger.warning(
                 f"Scraper {name} timed out "
                 f"(context={request.context.value}, budget={timeout:g}s)"
@@ -109,7 +117,8 @@ class ScraperManager:
             results = []
         except Exception as e:
             outcome = "error"
-            logger.warning(f"Scraper {name} failed: {e}")  # todo: better error handling
+            error_type = type(e).__name__
+            logger.warning(f"Scraper {name} failed: {error_type}")
             results = []
         duration = time.perf_counter() - started_at
         metrics.observe_scraper(
@@ -118,6 +127,11 @@ class ScraperManager:
             outcome,
             duration,
             len(results) if isinstance(results, list) else 0,
+        )
+        await scraper_health.record_outcome(
+            name,
+            outcome,
+            error_type=error_type,
         )
         return name, results, duration
 
@@ -130,6 +144,19 @@ class ScraperManager:
 
     async def scrape_all(self, request: ScrapeRequest):
         tasks = []
+
+        async def append_if_healthy(display_name: str, scraper: BaseScraper, timeout):
+            decision = await scraper_health.should_allow(display_name)
+            if not decision.allowed:
+                logger.debug(
+                    f"Scraper {display_name} skipped while {decision.state} "
+                    f"(retry_at={decision.next_retry_at})"
+                )
+                return
+            tasks.append(
+                self._scrape_wrapper(display_name, scraper, request, timeout)
+            )
+
         is_anime_content = None
         for scraper_name, scraper_class in self.scrapers.items():
             # Determine if scraper should be enabled
@@ -174,13 +201,10 @@ class ScraperManager:
                             continue
                         active_instance_count += 1
                         scraper = scraper_class(self, client, parsed_url, password)
-                        tasks.append(
-                            self._scrape_wrapper(
-                                f"{scraper_name_clean} #{active_instance_count}",
-                                scraper,
-                                request,
-                                scrape_timeout,
-                            )
+                        await append_if_healthy(
+                            f"{scraper_name_clean} #{active_instance_count}",
+                            scraper,
+                            scrape_timeout,
                         )
 
             elif scraper_name == "AiostreamsScraper":
@@ -195,13 +219,10 @@ class ScraperManager:
                             continue
                         active_instance_count += 1
                         scraper = scraper_class(self, client, parsed_url, credentials)
-                        tasks.append(
-                            self._scrape_wrapper(
-                                f"{scraper_name_clean} #{active_instance_count}",
-                                scraper,
-                                request,
-                                scrape_timeout,
-                            )
+                        await append_if_healthy(
+                            f"{scraper_name_clean} #{active_instance_count}",
+                            scraper,
+                            scrape_timeout,
                         )
 
             else:
@@ -221,23 +242,17 @@ class ScraperManager:
                             continue
                         active_instance_count += 1
                         scraper = scraper_class(self, client, parsed_url)
-                        tasks.append(
-                            self._scrape_wrapper(
-                                f"{scraper_name_clean} #{active_instance_count}",
-                                scraper,
-                                request,
-                                scrape_timeout,
-                            )
+                        await append_if_healthy(
+                            f"{scraper_name_clean} #{active_instance_count}",
+                            scraper,
+                            scrape_timeout,
                         )
                 else:
                     scraper = scraper_class(self, client)
-                    tasks.append(
-                        self._scrape_wrapper(
-                            scraper_name_clean,
-                            scraper,
-                            request,
-                            scrape_timeout,
-                        )
+                    await append_if_healthy(
+                        scraper_name_clean,
+                        scraper,
+                        scrape_timeout,
                     )
 
         scraper_tasks = [asyncio.create_task(task) for task in tasks]

@@ -154,6 +154,35 @@ SCRAPE_LOCKS_TABLE_SPEC = ManagedTableSpec(
     ),
 )
 
+SCRAPER_HEALTH_TABLE_SPEC = ManagedTableSpec(
+    table_name="scraper_health",
+    create_sql="""
+        CREATE TABLE {table_name} (
+            scraper_key TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            state TEXT NOT NULL,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            recovery_successes INTEGER NOT NULL DEFAULT 0,
+            backoff_level INTEGER NOT NULL DEFAULT 0,
+            total_attempts INTEGER NOT NULL DEFAULT 0,
+            total_successes INTEGER NOT NULL DEFAULT 0,
+            total_failures INTEGER NOT NULL DEFAULT 0,
+            last_outcome TEXT,
+            last_error_type TEXT,
+            last_attempt_at REAL,
+            last_success_at REAL,
+            next_retry_at REAL,
+            updated_at REAL NOT NULL
+        )
+    """,
+    index_sql=(
+        """
+            CREATE INDEX IF NOT EXISTS idx_scraper_health_state_retry_v1
+            ON {table_name} (state, next_retry_at)
+        """,
+    ),
+)
+
 KODI_SETUP_CODES_TABLE_SPEC = ManagedTableSpec(
     table_name="kodi_setup_codes",
     create_sql="""
@@ -842,6 +871,7 @@ BACKGROUND_SCRAPER_EPISODES_COPY_SQL = """
 
 CURRENT_NON_UNIQUE_INDEX_SPECS = (
     SCRAPE_LOCKS_TABLE_SPEC,
+    SCRAPER_HEALTH_TABLE_SPEC,
     KODI_SETUP_CODES_TABLE_SPEC,
     MEDIA_METADATA_CACHE_TABLE_SPEC,
     IMDB_TITLE_LOOKUP_TABLE_SPEC,

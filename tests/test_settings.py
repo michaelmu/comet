@@ -52,6 +52,33 @@ class AppSettingsTests(unittest.TestCase):
             {"zilean": 90.0, "jackett:live": 20.5},
         )
 
+    def test_scraper_health_defaults_are_safe(self):
+        settings = AppSettings(_env_file=None)
+
+        self.assertTrue(settings.SCRAPER_HEALTH_ENABLED)
+        self.assertEqual(settings.SCRAPER_HEALTH_FAILURE_THRESHOLD, 5)
+        self.assertEqual(settings.SCRAPER_HEALTH_INITIAL_COOLDOWN, 900)
+        self.assertEqual(settings.SCRAPER_HEALTH_MAX_COOLDOWN, 21600)
+        self.assertEqual(settings.SCRAPER_HEALTH_RECOVERY_SUCCESSES, 2)
+
+    def test_invalid_scraper_health_configuration_fails(self):
+        for field in (
+            "SCRAPER_HEALTH_FAILURE_THRESHOLD",
+            "SCRAPER_HEALTH_INITIAL_COOLDOWN",
+            "SCRAPER_HEALTH_MAX_COOLDOWN",
+            "SCRAPER_HEALTH_RECOVERY_SUCCESSES",
+            "SCRAPER_HEALTH_PROBE_INTERVAL",
+        ):
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                AppSettings(_env_file=None, **{field: 0})
+
+        with self.assertRaisesRegex(ValidationError, "cannot be shorter"):
+            AppSettings(
+                _env_file=None,
+                SCRAPER_HEALTH_INITIAL_COOLDOWN=900,
+                SCRAPER_HEALTH_MAX_COOLDOWN=300,
+            )
+
     def test_invalid_scrape_timeout_configuration_fails(self):
         for field in ("LIVE_SCRAPE_TIMEOUT", "BACKGROUND_SCRAPE_TIMEOUT"):
             for value in (True, 0, -1, float("inf"), None):

@@ -93,7 +93,7 @@ class DebridioScraper(BaseScraper):
         except Exception as e:
             log_scraper_error(
                 "Debridio",
-                f"{settings.DEBRIDIO_PROVIDER}|{settings.DEBRIDIO_PROVIDER_KEY}",
+                "https://addon.debridio.com",
                 request.media_id,
                 e,
             )

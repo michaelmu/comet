@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 
 from RTN import DefaultRanking, ParsedData
@@ -12,6 +13,7 @@ from comet.scrapers.models import ScrapeRequest
 from comet.services.filtering import filter_worker
 from comet.services.ranking import rank_worker
 from comet.services.torrent_manager import torrent_update_queue
+from comet.utils.formatting import normalize_info_hash
 from comet.utils.languages import select_indexer_titles
 from comet.utils.media_ids import normalize_cache_media_ids
 from comet.utils.parsing import (
@@ -41,12 +43,15 @@ def _is_current_scrape_result(torrent: object) -> bool:
         "tracker",
         "sources",
     }
+    info_hash = torrent.get("infoHash")
+    normalized_info_hash = (
+        normalize_info_hash(info_hash) if isinstance(info_hash, str) else ""
+    )
     return (
         required_keys <= torrent.keys()
         and isinstance(torrent["title"], str)
         and bool(torrent["title"])
-        and isinstance(torrent["infoHash"], str)
-        and bool(torrent["infoHash"])
+        and re.fullmatch(r"[0-9a-f]{40}", normalized_info_hash) is not None
         and _is_optional_int(torrent["fileIndex"])
         and _is_optional_int(torrent["seeders"])
         and _is_optional_int(torrent["size"])
@@ -54,6 +59,56 @@ def _is_current_scrape_result(torrent: object) -> bool:
         and isinstance(torrent["sources"], list)
         and all(isinstance(source, str) for source in torrent["sources"])
     )
+
+
+def _torrent_candidate_priority(torrent: dict) -> tuple:
+    file_index = torrent.get("fileIndex")
+    size = torrent.get("size")
+    seeders = torrent.get("seeders")
+    sources = torrent.get("sources") or []
+    return (
+        file_index is not None,
+        isinstance(size, int) and size > 0,
+        seeders is not None,
+        len(sources),
+        size if isinstance(size, int) else -1,
+        seeders if isinstance(seeders, int) else -1,
+        str(torrent.get("tracker", "")).casefold(),
+        str(torrent.get("title", "")).casefold(),
+        -(file_index if isinstance(file_index, int) else 0),
+    )
+
+
+def merge_torrent_candidates(torrents: list[dict]) -> list[dict]:
+    """Deterministically keep the richest candidate for each info hash."""
+
+    grouped: dict[str, list[dict]] = {}
+    for torrent in torrents:
+        info_hash = normalize_info_hash(torrent["infoHash"])
+        normalized = {**torrent, "infoHash": info_hash}
+        grouped.setdefault(info_hash, []).append(normalized)
+
+    merged = []
+    for info_hash in sorted(grouped):
+        candidates = grouped[info_hash]
+        best = max(candidates, key=_torrent_candidate_priority).copy()
+        best["sources"] = sorted(
+            {
+                source
+                for candidate in candidates
+                for source in candidate.get("sources", [])
+                if isinstance(source, str) and source
+            }
+        )
+        known_seeders = [
+            candidate["seeders"]
+            for candidate in candidates
+            if isinstance(candidate.get("seeders"), int)
+        ]
+        if known_seeders:
+            best["seeders"] = max(known_seeders)
+        merged.append(best)
+    return merged
 
 
 class TorrentManager:
@@ -163,6 +218,7 @@ class TorrentManager:
         ):
             await self.filter_manager(scraper_name, results, response_time)
 
+        self.ready_to_cache = merge_torrent_candidates(self.ready_to_cache)
         await self.cache_torrents()
 
         for torrent in self.ready_to_cache:
@@ -342,9 +398,13 @@ class TorrentManager:
             logger.log("SCRAPER", f"Scraper {scraper_name} found 0 torrents.{timing}")
             return
 
-        valid_torrents = [
-            torrent for torrent in torrents if _is_current_scrape_result(torrent)
-        ]
+        valid_torrents = []
+        for torrent in torrents:
+            if not _is_current_scrape_result(torrent):
+                continue
+            valid_torrents.append(
+                {**torrent, "infoHash": normalize_info_hash(torrent["infoHash"])}
+            )
         if len(valid_torrents) != len(torrents):
             logger.warning(
                 f"Scraper {scraper_name} returned "
@@ -354,11 +414,11 @@ class TorrentManager:
         new_torrents = [
             torrent
             for torrent in valid_torrents
-            if (torrent["infoHash"], torrent["title"]) not in self.seen_hashes
+            if (torrent["infoHash"], torrent["fileIndex"]) not in self.seen_hashes
         ]
 
         self.seen_hashes.update(
-            (torrent["infoHash"], torrent["title"]) for torrent in new_torrents
+            (torrent["infoHash"], torrent["fileIndex"]) for torrent in new_torrents
         )
 
         logger.log(

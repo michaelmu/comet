@@ -156,8 +156,24 @@ class IndexerScraperTests(unittest.IsolatedAsyncioTestCase):
         )
         logger_opt.assert_called_once_with(depth=1)
         logger_opt.return_value.warning.assert_called_once_with(
-            "Prowlarr query 'Failed' (https://prowlarr.test) failed: "
-            "RuntimeError: transport failed"
+            "Prowlarr query 'Failed' (https://prowlarr.test) failed: RuntimeError"
+        )
+
+    async def test_prowlarr_raises_when_every_query_fails(self):
+        scraper = ProwlarrScraper(None, None, "https://prowlarr.test")
+        scraper._fetch_search_results = AsyncMock(
+            side_effect=RuntimeError("secret-bearing transport detail")
+        )
+        with (
+            patch("comet.scrapers.prowlarr.settings.PROWLARR_INDEXERS", ["1"]),
+            patch("comet.scrapers.base.logger.opt"),
+            patch("comet.scrapers.prowlarr.logger.warning") as warning,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "all concurrent tasks failed"):
+                await scraper.scrape(REQUEST)
+
+        warning.assert_called_once_with(
+            "Exception while getting torrents for Movie with Prowlarr: RuntimeError"
         )
 
     async def test_stremthru_discards_invalid_magnets_before_filtering(self):

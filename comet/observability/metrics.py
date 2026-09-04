@@ -133,6 +133,17 @@ class CometMetrics:
             "Torrent candidates returned by scrapers.",
             ("scraper", "context"),
         )
+        self.scraper_health = Gauge(
+            "comet_scraper_health_state",
+            "Effective scraper health state (healthy=0, half-open=1, quarantined=2).",
+            ("scraper",),
+            multiprocess_mode="livemostrecent",
+        )
+        self.scraper_quarantines = Counter(
+            "comet_scraper_quarantines_total",
+            "Scraper quarantine transitions by triggering outcome.",
+            ("scraper", "outcome"),
+        )
 
         self.debrid_requests = Counter(
             "comet_debrid_requests_total",
@@ -286,6 +297,20 @@ class CometMetrics:
         self._child("scraper_duration", scraper, context, outcome).observe(duration)
         if result_count:
             self._child("scraper_results", scraper, context).inc(result_count)
+
+    def set_scraper_health(self, scraper: str, state: str) -> None:
+        if not self.enabled:
+            return
+        scraper = _normalize_scraper_label(scraper)
+        state_value = {"healthy": 0, "half_open": 1, "quarantined": 2}.get(
+            state, 2
+        )
+        self._child("scraper_health", scraper).set(state_value)
+
+    def observe_scraper_quarantine(self, scraper: str, outcome: str) -> None:
+        if self.enabled:
+            scraper = _normalize_scraper_label(scraper)
+            self._child("scraper_quarantines", scraper, outcome).inc()
 
     def observe_debrid(
         self,

@@ -165,15 +165,21 @@ def censor_url(url: str):
         return url
     if "://" in url:
         try:
-            scheme, rest = url.split("://", 1)
-            if "@" in rest:
-                auth, host = rest.split("@", 1)
-                if ":" in auth:
-                    user, password = auth.split(":", 1)
-                    return f"{scheme}://{user}:{censor(password)}@{host}"
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            host = parsed.hostname or ""
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            if parsed.username:
+                host = f"{parsed.username}:***@{host}"
+            # Paths and query strings frequently contain encoded addon configs,
+            # API tokens, or user credentials. The origin is enough to identify
+            # an upstream safely.
+            return f"{parsed.scheme}://{host}"
         except Exception:
             pass
-    return url
+    return "<redacted>"
 
 
 def log_scraper_error(
@@ -192,7 +198,9 @@ def log_scraper_error(
         )
     else:
         logger.warning(
-            f"Exception while getting torrents for {media_id} with {scraper_name} ({censor_url(scraper_url)}), you are most likely being ratelimited{api_password_missing}: {error}"
+            f"Exception while getting torrents for {media_id} with {scraper_name} "
+            f"({censor_url(scraper_url)}), you may be rate limited"
+            f"{api_password_missing}: {type(error).__name__}"
         )
 
 

@@ -25,9 +25,15 @@ class ScraperManagerTaskTests(unittest.IsolatedAsyncioTestCase):
             context="live",
         )
 
-        with patch(
-            "comet.scrapers.manager.time.perf_counter",
-            side_effect=(10.0, 10.875),
+        with (
+            patch(
+                "comet.scrapers.manager.time.perf_counter",
+                side_effect=(10.0, 10.875),
+            ),
+            patch(
+                "comet.scrapers.manager.scraper_health.record_outcome",
+                new=AsyncMock(),
+            ) as record_outcome,
         ):
             name, results, response_time = await manager._scrape_wrapper(
                 "Example", scraper, request, timeout=30
@@ -36,6 +42,34 @@ class ScraperManagerTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(name, "Example")
         self.assertEqual(results, [{"title": "Result"}])
         self.assertEqual(response_time, 0.875)
+        record_outcome.assert_awaited_once_with(
+            "Example", "success", error_type=None
+        )
+
+    async def test_scrape_wrapper_reports_invalid_container_to_health(self):
+        manager = ScraperManager.__new__(ScraperManager)
+        scraper = AsyncMock()
+        scraper.scrape.return_value = {"streams": []}
+        request = ScrapeRequest(
+            media_type="movie",
+            media_id="tt123",
+            media_only_id="tt123",
+            title="Title",
+            context="live",
+        )
+
+        with patch(
+            "comet.scrapers.manager.scraper_health.record_outcome",
+            new=AsyncMock(),
+        ) as record_outcome:
+            _, results, _ = await manager._scrape_wrapper(
+                "Example", scraper, request, timeout=30
+            )
+
+        self.assertEqual(results, [])
+        record_outcome.assert_awaited_once_with(
+            "Example", "invalid", error_type="InvalidResultContainer"
+        )
 
     def test_timeout_resolution_uses_most_specific_override(self):
         manager = ScraperManager.__new__(ScraperManager)

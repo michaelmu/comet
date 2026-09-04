@@ -33,6 +33,7 @@ from comet.core.schema_specs import (
     METRICS_CACHE_TABLE_SPEC,
     NULL_SCOPE_SENTINEL,
     SCRAPE_LOCKS_TABLE_SPEC,
+    SCRAPER_HEALTH_TABLE_SPEC,
     SERIES_EPISODE_INDEX_REFRESH_TABLE_SPEC,
     SERIES_EPISODE_INDEX_TABLE_SPEC,
     TORRENTS_TABLE_SPEC,
@@ -994,6 +995,11 @@ async def _migration_media_demand_scrape_coverage(ctx: MigrationContext):
     return True
 
 
+async def _migration_scraper_health(ctx: MigrationContext):
+    await _ensure_managed_table(ctx, SCRAPER_HEALTH_TABLE_SPEC)
+    return True
+
+
 MIGRATIONS = [
     ("2026030901_foundation", _migration_foundation),
     ("2026030902_backfill_canonical_tables", _migration_backfill_canonical_tables),
@@ -1018,4 +1024,5 @@ MIGRATIONS = [
         _migration_media_demand_scrape_coverage,
     ),
     ("2026072701_imdb_title_lookup", _migration_imdb_title_lookup),
+    ("2026090401_scraper_health", _migration_scraper_health),
 ]

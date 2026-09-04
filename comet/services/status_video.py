@@ -24,16 +24,22 @@ def _iter_normalized_keys(status_keys: Iterable[str | None]) -> list[str]:
     return normalized_keys
 
 
-def _status_video_directory_revision() -> int | None:
+def _status_video_directory_revision() -> tuple[int, tuple[str, ...]] | None:
     try:
-        return STATUS_VIDEO_DIR.stat().st_mtime_ns
+        # Some filesystems expose directory mtimes at a coarser resolution than
+        # Python's nanosecond API. Include the small asset filename set so an
+        # add/remove cannot reuse a stale cached index within the same tick.
+        return (
+            STATUS_VIDEO_DIR.stat().st_mtime_ns,
+            tuple(sorted(path.name for path in STATUS_VIDEO_DIR.glob("*.mp4"))),
+        )
     except FileNotFoundError:
         return None
 
 
 @lru_cache(maxsize=4)
 def _build_status_video_index(
-    directory_revision: int | None,
+    directory_revision: tuple[int, tuple[str, ...]] | None,
 ) -> dict[str, str]:
     del directory_revision
     status_files = sorted(STATUS_VIDEO_DIR.glob("*.mp4"))

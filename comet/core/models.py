@@ -76,6 +76,13 @@ _SCRAPE_TIMEOUT_FIELDS = (
     "LIVE_SCRAPE_TIMEOUT",
     "BACKGROUND_SCRAPE_TIMEOUT",
 )
+_POSITIVE_SCRAPER_HEALTH_FIELDS = (
+    "SCRAPER_HEALTH_FAILURE_THRESHOLD",
+    "SCRAPER_HEALTH_INITIAL_COOLDOWN",
+    "SCRAPER_HEALTH_MAX_COOLDOWN",
+    "SCRAPER_HEALTH_RECOVERY_SUCCESSES",
+    "SCRAPER_HEALTH_PROBE_INTERVAL",
+)
 _POSITIVE_COMETNET_OPERATION_FIELDS = (
     "COMETNET_MAX_PEERS",
     "COMETNET_TIME_CHECK_TIMEOUT",
@@ -180,6 +187,12 @@ class AppSettings(ServerSettings):
     LIVE_SCRAPE_TIMEOUT: float = 30.0
     BACKGROUND_SCRAPE_TIMEOUT: float = 30.0
     SCRAPER_TIMEOUT_OVERRIDES: dict[str, float] = Field(default_factory=dict)
+    SCRAPER_HEALTH_ENABLED: bool = True
+    SCRAPER_HEALTH_FAILURE_THRESHOLD: int = 5
+    SCRAPER_HEALTH_INITIAL_COOLDOWN: int = 900
+    SCRAPER_HEALTH_MAX_COOLDOWN: int = 21600
+    SCRAPER_HEALTH_RECOVERY_SUCCESSES: int = 2
+    SCRAPER_HEALTH_PROBE_INTERVAL: int = 60
     INDEXER_MANAGER_TYPE: str | None = None
     INDEXER_MANAGER_URL: str | None = "http://127.0.0.1:9117"
     INDEXER_MANAGER_API_KEY: str | None = None
@@ -460,6 +473,27 @@ class AppSettings(ServerSettings):
     @field_validator(*_SCRAPE_TIMEOUT_FIELDS, mode="before")
     def validate_scrape_timeout(cls, value):
         return cls._normalize_scrape_timeout(value)
+
+    @field_validator(*_POSITIVE_SCRAPER_HEALTH_FIELDS, mode="before")
+    def validate_scraper_health_value(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("scraper health values must be positive integers")
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("scraper health values must be positive integers") from None
+        if normalized <= 0:
+            raise ValueError("scraper health values must be positive integers")
+        return normalized
+
+    @field_validator("SCRAPER_HEALTH_MAX_COOLDOWN")
+    def validate_scraper_health_max_cooldown(cls, value, info):
+        initial = info.data.get("SCRAPER_HEALTH_INITIAL_COOLDOWN")
+        if initial is not None and value < initial:
+            raise ValueError(
+                "SCRAPER_HEALTH_MAX_COOLDOWN cannot be shorter than the initial cooldown"
+            )
+        return value
 
     @field_validator("SCRAPER_TIMEOUT_OVERRIDES", mode="before")
     def normalize_scraper_timeout_overrides(cls, value):
