@@ -62,9 +62,11 @@ class IndexerScraperTests(unittest.IsolatedAsyncioTestCase):
         expected_queries = {
             "English",
             "English S01",
+            "English Season 1",
             "English S01E02",
             "Italiano",
             "Italiano S01",
+            "Italiano Season 1",
             "Italiano S01E02",
         }
 

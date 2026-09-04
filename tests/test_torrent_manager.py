@@ -6,7 +6,7 @@ import bencodepy
 
 from comet.cometnet.manager import CometNetService
 from comet.services import torrent_manager
-from comet.services.torrent_manager import extract_torrent_metadata
+from comet.services.torrent_manager import download_torrent, extract_torrent_metadata
 from comet.utils.parsing import is_video
 
 
@@ -82,6 +82,25 @@ class TorrentMetadataTests(unittest.TestCase):
                 {"index": 5, "title": "also-valid.MP4", "size": 500},
             ],
         )
+
+
+class TorrentDownloadLoggingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failure_log_redacts_url_path_query_and_exception_detail(self):
+        session = Mock()
+        session.get.side_effect = RuntimeError("secret exception detail")
+
+        with patch("comet.services.torrent_manager.logger.debug") as debug:
+            result = await download_torrent(
+                session,
+                "http://prowlarr:9696/1/download?apikey=secret&link=encoded",
+            )
+
+        self.assertEqual(result, (None, None, None))
+        message = debug.call_args.args[0]
+        self.assertIn("http://prowlarr:9696", message)
+        self.assertIn("RuntimeError", message)
+        self.assertNotIn("apikey", message)
+        self.assertNotIn("secret", message)
 
 
 class TorrentPersistenceTests(unittest.IsolatedAsyncioTestCase):

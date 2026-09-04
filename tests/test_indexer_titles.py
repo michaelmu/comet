@@ -182,9 +182,11 @@ class IndexerTitleTests(unittest.TestCase):
             (
                 "English",
                 "English S02",
+                "English Season 2",
                 "English S02E03",
                 "Localized",
                 "Localized S02",
+                "Localized Season 2",
                 "Localized S02E03",
             ),
         )
@@ -204,7 +206,9 @@ class IndexerTitleTests(unittest.TestCase):
             (
                 "English",
                 "English S02",
+                "English Season 2",
                 "Localized",
                 "Localized S02",
+                "Localized Season 2",
             ),
         )

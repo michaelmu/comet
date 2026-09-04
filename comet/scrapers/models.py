@@ -31,6 +31,7 @@ class ScrapeRequest(BaseModel):
                 and self.season is not None
             ):
                 queries.append(f"{title} S{self.season:02d}")
+                queries.append(f"{title} Season {self.season}")
                 if self.episode is not None:
                     queries.append(f"{title} S{self.season:02d}E{self.episode:02d}")
         return tuple(dict.fromkeys(queries))

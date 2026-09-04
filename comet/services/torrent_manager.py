@@ -32,7 +32,7 @@ from comet.core.database import (
     encode_json_param,
     normalize_scope_value,
 )
-from comet.core.logger import logger
+from comet.core.logger import censor_url, logger
 from comet.core.models import database, settings
 from comet.utils.formatting import normalize_info_hash
 from comet.utils.parsing import default_dump, ensure_multi_language, is_video
@@ -357,7 +357,9 @@ async def download_torrent(session, url: str):
             return (None, None, None)
     except Exception as e:
         logger.debug(
-            f"Failed to download torrent from {url}: {e} (in most cases, you can ignore this error)"
+            "Failed to download torrent from "
+            f"{censor_url(url)}: {type(e).__name__} "
+            "(in most cases, you can ignore this error)"
         )
         return (None, None, None)
 

@@ -52,6 +52,7 @@ _SCRAPER_MODE_FIELDS = (
     "SCRAPE_STREMTHRU",
     "SCRAPE_DMM",
     "SCRAPE_BITMAGNET",
+    "SCRAPE_TORRENTGALAXY",
     "SCRAPE_TORRENTIO",
     "SCRAPE_MEDIAFUSION",
     "SCRAPE_AIOSTREAMS",
@@ -242,6 +243,8 @@ class AppSettings(ServerSettings):
     BITMAGNET_URL: str | list[str] = "https://bitmagnetfortheweebs.midnightignite.me"
     BITMAGNET_MAX_CONCURRENT_PAGES: int | None = 5
     BITMAGNET_MAX_OFFSET: int | None = 15000
+    SCRAPE_TORRENTGALAXY: bool | str = False
+    TORRENTGALAXY_URL: str | list[str] = "https://torrentgalaxy.one"
     SCRAPE_TORRENTIO: bool | str = False
     TORRENTIO_URL: str | list[str] = "https://torrentio.strem.fun"
     SCRAPE_MEDIAFUSION: bool | str = False
@@ -678,6 +681,7 @@ class AppSettings(ServerSettings):
         "STREMTHRU_URL",
         "STREMTHRU_SCRAPE_URL",
         "BITMAGNET_URL",
+        "TORRENTGALAXY_URL",
         "COMET_URL",
         "ZILEAN_URL",
         "TORRENTIO_URL",

@@ -519,6 +519,18 @@ def log_startup_info(settings):
         f"Bitmagnet Scraper: {settings.format_scraper_mode(settings.SCRAPE_BITMAGNET)}{bitmagnet_info}",
     )
 
+    torrentgalaxy_url = (
+        f" - {settings.TORRENTGALAXY_URL}"
+        if settings.is_any_context_enabled(settings.SCRAPE_TORRENTGALAXY)
+        else ""
+    )
+    logger.log(
+        "COMET",
+        "TorrentGalaxy Scraper: "
+        f"{settings.format_scraper_mode(settings.SCRAPE_TORRENTGALAXY)}"
+        f"{torrentgalaxy_url}",
+    )
+
     torrentio_url = (
         f" - {settings.TORRENTIO_URL}"
         if settings.is_any_context_enabled(settings.SCRAPE_TORRENTIO)
